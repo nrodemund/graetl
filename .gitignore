@@ -1,0 +1,36 @@
+# ---------------------------------------------------------------------------
+# GraETL
+# ---------------------------------------------------------------------------
+
+# The pipelines folder is runtime state: SQLite databases (etl.db, state.db),
+# WAL/SHM sidecars, run logs, profiles and imported data. It is hundreds of
+# megabytes and regenerates itself -- keep it out of git entirely.
+pipelines/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Node
+node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Databases and dumps, wherever they turn up
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Local
+.env
+*.local
+.DS_Store
+Thumbs.db

@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>GraETL</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%235b8cff'/%3E%3Cpath d='M9 22V10h5l4 6 4-6h1v12' stroke='%23fff' stroke-width='2.5' fill='none' stroke-linejoin='round'/%3E%3C/svg%3E" />
+<link rel="stylesheet" href="/app.css" />
+</head>
+<body>
+<div id="app" class="shell">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark">G</div>
+      <div>
+        <div class="brand-name">GraETL</div>
+        <div class="brand-sub" id="brand-sub">connecting…</div>
+      </div>
+    </div>
+    <nav class="nav">
+      <a class="nav-item" href="#/" data-nav="dashboard"><span class="ico">▤</span> Dashboard</a>
+      <a class="nav-item" href="#/runs" data-nav="runs"><span class="ico">⟳</span> Runs</a>
+    </nav>
+    <div class="side-head">
+      <span>Pipelines</span>
+      <div class="side-head-actions">
+        <button class="icon-btn" id="btn-sync" title="Rescan the pipelines folder">⟲</button>
+        <button class="icon-btn" id="btn-new" title="New pipeline">＋</button>
+      </div>
+    </div>
+    <div class="pipeline-list" id="pipeline-list"></div>
+    <div class="side-foot" id="side-foot"></div>
+  </aside>
+  <main class="main" id="main"></main>
+</div>
+
+<div class="modal-backdrop" id="modal" hidden>
+  <div class="modal">
+    <div class="modal-head" id="modal-title">Dialog</div>
+    <div class="modal-body" id="modal-body"></div>
+    <div class="modal-foot">
+      <button class="btn ghost" data-close>Cancel</button>
+      <button class="btn primary" id="modal-ok">OK</button>
+    </div>
+  </div>
+</div>
+<div class="toasts" id="toasts"></div>
+<script type="module" src="/app.js"></script>
+</body>
+</html>

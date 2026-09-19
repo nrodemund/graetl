@@ -1,0 +1,39 @@
+# GraETL project configuration
+[server]
+host = "127.0.0.1"
+port = 8777
+
+[paths]
+# Everything portable lives here: code, config, state, logs, etl.db
+pipelines = "pipelines"
+
+[runtime]
+log_retention_runs = 50     # JSONL console logs kept per pipeline
+console_buffer_lines = 2000 # lines replayed to a newly opened console
+stop_grace_seconds = 20     # graceful stop window before the process is killed
+heartbeat_seconds = 3
+control_poll_seconds = 0.5
+parallel_modules = 1        # modules of one execution layer to run at once
+entity_batch_size = 500     # entities claimed per batch inside a module
+lock_retries = 5            # retries when a parallel module loses a write race
+cache_size = 4096           # entries kept per cached pipeline function
+# python_executable = "C:/path/to/python.exe"
+
+[ui]
+# Where the browser loads the Monaco code editor from. A copy vendored into the
+# install (backend/graetl/server/static/vendor/vs) always wins; run
+# `graetl vendor-monaco` to create one. Set this to "" to force the small
+# built-in editor instead of Monaco.
+monaco_url = "https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs"
+
+[graphs]
+# Defaults for node graphs. Both can also be set per pipeline in pipeline.toml.
+# Reflected nodes (py:math.floor and friends) are treated as pure - no execution
+# pins, folded into the expression that uses them - when their module is listed
+# here. Leave it unset for the built-in list of side-effect-free stdlib modules.
+# pure_modules = ["math", "statistics", "json", "re", "datetime"]
+#
+# When set, only these dotted roots may be reflected at all. Unset means any
+# importable callable is fair game, which is the same power pipeline.py already
+# has.
+# reflect_allow = ["math", "statistics"]

@@ -76,11 +76,21 @@ def work(ctx, entity):
 '''
 
 
-def make_project(tmp: Path) -> Path:
+def make_project(tmp: Path, *, target: str = "sqlite", dsn: str = "") -> Path:
+    """An instance root that is also a project - the shortest useful fixture."""
     (tmp / "pipelines").mkdir(parents=True, exist_ok=True)
     (tmp / "graetl.toml").write_text(
         '[server]\nhost="127.0.0.1"\nport=8999\n[runtime]\nstop_grace_seconds=5\n'
         "control_poll_seconds=0.2\nheartbeat_seconds=1\n",
+        encoding="utf-8",
+    )
+    if target == "postgres":
+        block = f'system = "postgres"\ndsn = "{dsn}"\nschema = "graetl"'
+    else:
+        block = 'system = "sqlite"\npath = "warehouse.db"'
+    (tmp / "project.toml").write_text(
+        f'schema = 1\n[project]\nname = "test"\ntitle = "Test Warehouse"\n'
+        f"[target]\n{block}\n[files]\nroot = \"files\"\n",
         encoding="utf-8",
     )
     return tmp
@@ -136,6 +146,11 @@ class GraetlTestCase(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.root = make_project(Path(self._tmp.name))
         self.settings = load_settings(self.root)
+
+    @property
+    def warehouse(self) -> Path:
+        """The project's target database file."""
+        return self.root / "warehouse.db"
 
     def tearDown(self) -> None:
         self._tmp.cleanup()
@@ -332,7 +347,7 @@ class TestApi(GraetlTestCase):
             self.assertEqual([e["entity_id"] for e in failed], ["E2"])
 
             # the failing entity's own write was rolled back, the others persisted
-            with StateStore(self.settings.state_db_path("flaky")) as state:
+            with self.settings.state_store("flaky") as state:
                 ids = {r[0] for r in state.conn.execute("SELECT id FROM ok").fetchall()}
             self.assertEqual(ids, {"E0", "E1", "E3"})
 
@@ -670,7 +685,7 @@ class TestModuleFiles(GraetlTestCase):
             steps = {s["step"] for s in client.get(f"/api/runs/{run['id']}/steps").json()}
             self.assertTrue({"load_vital_signals", "verify", "verify_twice"} <= steps)
 
-        with StateStore(self.settings.state_db_path("folders")) as state:
+        with self.settings.state_store("folders") as state:
             rows = dict(state.conn.execute("SELECT id, label FROM out").fetchall())
         self.assertEqual(rows, {"E0": "E0", "E1": "E1", "E2": "E2"})
 
@@ -910,7 +925,7 @@ class TestParallelExecution(GraetlTestCase):
         )
 
     def _hits(self):
-        with StateStore(self.settings.state_db_path("par")) as state:
+        with self.settings.state_store("par") as state:
             return [dict(r) for r in state.conn.execute("SELECT * FROM hits").fetchall()]
 
     def test_modules_of_a_layer_overlap_but_each_runs_single_threaded(self) -> None:
@@ -952,7 +967,7 @@ class TestParallelExecution(GraetlTestCase):
             self.assertEqual(final["status"], "succeeded", final.get("error"))
             self.assertEqual(final["metrics"]["processed"], 18)
         self.assertEqual(len(self._hits()), 18)
-        with StateStore(self.settings.state_db_path("par")) as state:
+        with self.settings.state_store("par") as state:
             self.assertEqual(state.status_counts(), {"done": 18})
             self.assertEqual(state.list_module_locks(), [])  # every lock released
 
@@ -978,7 +993,7 @@ class TestModuleLocks(GraetlTestCase):
     def test_second_worker_is_refused_and_a_dead_one_is_taken_over(self) -> None:
         from graetl.store.state import LockConflict
 
-        path = self.root / "locks.db"
+        path = self.warehouse
         with StateStore(path) as first, StateStore(path) as second:
             owner = first.acquire_module_lock("calc", run_id=1)
             with self.assertRaises(LockConflict):
@@ -986,7 +1001,7 @@ class TestModuleLocks(GraetlTestCase):
 
             # A worker that stopped beating is considered dead and taken over.
             first.conn.execute(
-                "UPDATE module_locks SET heartbeat_at = '2000-01-01T00:00:00.000Z' "
+                "UPDATE [[module_locks]] SET heartbeat_at = '2000-01-01T00:00:00.000Z' "
                 "WHERE module = 'calc'"
             )
             taken = second.acquire_module_lock("calc", run_id=2)
@@ -994,7 +1009,7 @@ class TestModuleLocks(GraetlTestCase):
             self.assertEqual(second.list_module_locks()[0]["run_id"], 2)
 
     def test_lock_is_released_after_the_context_exits(self) -> None:
-        path = self.root / "locks.db"
+        path = self.warehouse
         with StateStore(path) as store:
             with store.module_lock("m", run_id=1):
                 self.assertEqual(len(store.list_module_locks()), 1)
@@ -1004,7 +1019,7 @@ class TestModuleLocks(GraetlTestCase):
         """A blocked writer rolls back cleanly instead of recording a failure."""
         from graetl.store.state import LockConflict
 
-        path = self.root / "state.db"
+        path = self.warehouse
         with StateStore(path) as writer, StateStore(path) as blocker:
             writer.conn.execute("CREATE TABLE t (id TEXT)")
             writer.upsert_entities([("A", None, None, {})])
@@ -1470,7 +1485,7 @@ class TestGraphCompiler(GraetlTestCase):
         self.assertIsNotNone(final, "the graph-defined pipeline did not succeed")
         self.assertEqual(final["metrics"]["processed"], 4)
 
-        state = sqlite3.connect(self.settings.state_db_path("graphs"))
+        state = sqlite3.connect(self.warehouse)
         rows = dict(state.execute("SELECT id, band FROM scored").fetchall())
         state.close()
         self.assertEqual(rows, {"E1": "low", "E2": "high", "E3": "high", "E4": "high"})
@@ -2161,14 +2176,14 @@ class TestEntryKinds(GraetlTestCase):
             )
             self.assertEqual(final["status"], "failed", final.get("error"))
 
-        with StateStore(self.settings.state_db_path("bulky")) as state:
+        with self.settings.state_store("bulky") as state:
             rows = state.conn.execute(
-                "SELECT status, COUNT(*) FROM entity_module_state WHERE module = 'good' "
+                "SELECT status, COUNT(*) FROM [[entity_module_state]] WHERE pipeline = 'bulky' AND module = 'good' "
                 "GROUP BY status"
             ).fetchall()
             self.assertEqual(dict(rows), {"done": 6}, "the clean batches committed")
             rows = state.conn.execute(
-                "SELECT status, COUNT(*) FROM entity_module_state WHERE module = 'poison' "
+                "SELECT status, COUNT(*) FROM [[entity_module_state]] WHERE pipeline = 'bulky' AND module = 'poison' "
                 "GROUP BY status"
             ).fetchall()
             # The batch that raised took its whole batch down with it; nothing
@@ -2203,10 +2218,10 @@ class TestEntryKinds(GraetlTestCase):
                     else None
                 )
             )
-        with StateStore(self.settings.state_db_path("bulky")) as state:
+        with self.settings.state_store("bulky") as state:
             self.assertEqual(
                 state.conn.execute(
-                    "SELECT COUNT(*) FROM entity_module_state WHERE module = 'summarise'"
+                    "SELECT COUNT(*) FROM [[entity_module_state]] WHERE pipeline = 'bulky' AND module = 'summarise'"
                 ).fetchone()[0],
                 0,
                 "a once module has no entity state to keep",

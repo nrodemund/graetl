@@ -1,19 +1,21 @@
-"""The internal GraETL database: ``pipelines/etl.db``.
+"""GraETL's own bookkeeping: the pipeline registry and the run history.
 
-Holds the pipeline registry, the run history, per-module run statistics and
-the control channel the server uses to talk to running runner processes.
-Per-entity state lives in each pipeline's own ``state.db`` (see state.py).
+These tables live in the **project's target database**, in GraETL's namespace
+(``graetl_*`` on SQLite, schema ``graetl`` on PostgreSQL) - see
+:mod:`graetl.store.db`. Per-entity state is next door in :mod:`graetl.store.state`.
+
+SQL here is written once in SQLite's spelling; ``[[table]]`` markers and ``?``
+placeholders are translated per backend by the dialect.
 """
 
 from __future__ import annotations
 
 import functools
-import sqlite3
 import threading
 from pathlib import Path
 from typing import Any, Iterable
 
-from graetl.store.sqlite import apply_migrations, connect
+from graetl.store.db import Database, Target, apply_migrations, connect
 from graetl.utils import dumps, loads, now_iso
 
 
@@ -47,7 +49,7 @@ ACTIVE_STATUSES = frozenset(
 MIGRATIONS: list[str] = [
     # 1 - initial schema
     """
-    CREATE TABLE IF NOT EXISTS pipelines (
+    CREATE TABLE IF NOT EXISTS [[pipelines]] (
         id                TEXT PRIMARY KEY,
         title             TEXT NOT NULL,
         description       TEXT,
@@ -63,10 +65,10 @@ MIGRATIONS: list[str] = [
         updated_at        TEXT NOT NULL
     );
 
-    CREATE TABLE IF NOT EXISTS runs (
-        id                INTEGER PRIMARY KEY AUTOINCREMENT,
-        pipeline_id       TEXT NOT NULL REFERENCES pipelines(id) ON DELETE CASCADE,
-        parent_run_id     INTEGER REFERENCES runs(id) ON DELETE SET NULL,
+    CREATE TABLE IF NOT EXISTS [[runs]] (
+        id                [[pk]],
+        pipeline_id       TEXT NOT NULL REFERENCES [[pipelines]](id) ON DELETE CASCADE,
+        parent_run_id     BIGINT REFERENCES [[runs]](id) ON DELETE SET NULL,
         status            TEXT NOT NULL,
         mode              TEXT NOT NULL DEFAULT 'incremental',
         trigger           TEXT NOT NULL DEFAULT 'manual',
@@ -79,19 +81,20 @@ MIGRATIONS: list[str] = [
         progress_done     INTEGER NOT NULL DEFAULT 0,
         progress_total    INTEGER NOT NULL DEFAULT 0,
         metrics_json      TEXT NOT NULL DEFAULT '{}',
+        stats_json        TEXT,
         log_path          TEXT,
         error             TEXT,
         exit_code         INTEGER,
         created_at        TEXT NOT NULL,
         started_at        TEXT,
         finished_at       TEXT,
-        duration_ms       INTEGER
+        duration_ms       BIGINT
     );
-    CREATE INDEX IF NOT EXISTS idx_runs_pipeline ON runs(pipeline_id, id DESC);
-    CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
+    CREATE INDEX IF NOT EXISTS idx_runs_pipeline ON [[runs]](pipeline_id, id DESC);
+    CREATE INDEX IF NOT EXISTS idx_runs_status ON [[runs]](status);
 
-    CREATE TABLE IF NOT EXISTS run_steps (
-        run_id            INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    CREATE TABLE IF NOT EXISTS [[run_steps]] (
+        run_id            BIGINT NOT NULL REFERENCES [[runs]](id) ON DELETE CASCADE,
         step              TEXT NOT NULL,
         kind              TEXT NOT NULL,
         version           INTEGER NOT NULL DEFAULT 1,
@@ -101,7 +104,7 @@ MIGRATIONS: list[str] = [
         processed         INTEGER NOT NULL DEFAULT 0,
         skipped           INTEGER NOT NULL DEFAULT 0,
         failed            INTEGER NOT NULL DEFAULT 0,
-        duration_ms       INTEGER NOT NULL DEFAULT 0,
+        duration_ms       BIGINT NOT NULL DEFAULT 0,
         metrics_json      TEXT NOT NULL DEFAULT '{}',
         error             TEXT,
         started_at        TEXT,
@@ -109,50 +112,58 @@ MIGRATIONS: list[str] = [
         PRIMARY KEY (run_id, step)
     );
 
-    CREATE TABLE IF NOT EXISTS run_events (
-        id                INTEGER PRIMARY KEY AUTOINCREMENT,
-        run_id            INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    CREATE TABLE IF NOT EXISTS [[run_events]] (
+        id                [[pk]],
+        run_id            BIGINT NOT NULL REFERENCES [[runs]](id) ON DELETE CASCADE,
         ts                TEXT NOT NULL,
         level             TEXT NOT NULL DEFAULT 'info',
         kind              TEXT NOT NULL DEFAULT 'status',
         message           TEXT NOT NULL DEFAULT '',
         data_json         TEXT
     );
-    CREATE INDEX IF NOT EXISTS idx_run_events_run ON run_events(run_id, id);
+    CREATE INDEX IF NOT EXISTS idx_run_events_run ON [[run_events]](run_id, id);
 
-    CREATE TABLE IF NOT EXISTS settings (
+    CREATE TABLE IF NOT EXISTS [[settings]] (
         key               TEXT PRIMARY KEY,
         value_json        TEXT NOT NULL,
         updated_at        TEXT NOT NULL
     );
     """,
-    # 2 - live process telemetry of the running runner
-    """
-    ALTER TABLE runs ADD COLUMN stats_json TEXT;
-    """,
 ]
 
 
 class CoreStore:
-    """Thin repository over ``pipelines/etl.db``."""
+    """Thin repository over GraETL's own tables in the project target."""
 
-    def __init__(self, path: str | Path) -> None:
-        self.path = Path(path)
+    def __init__(self, db: Database | str | Path | Target) -> None:
+        self.db = _as_database(db)
         self._lock = threading.RLock()
-        self.conn: sqlite3.Connection = connect(self.path)
-        apply_migrations(self.conn, MIGRATIONS)
+        apply_migrations(self.db, MIGRATIONS, "core")
+
+    @property
+    def conn(self) -> Any:
+        """The underlying driver connection (diagnostics only)."""
+        return self.db.conn
 
     def close(self) -> None:
-        try:
-            self.conn.close()
-        except Exception:  # pragma: no cover - defensive
-            pass
+        self.db.close()
 
     def __enter__(self) -> CoreStore:
         return self
 
     def __exit__(self, *exc: object) -> None:
         self.close()
+
+    def _write(self, sql: str, params: Iterable[Any] = ()) -> Any:
+        """One statement in its own transaction - the old ``with self.conn``."""
+        self.db.begin("immediate")
+        try:
+            cur = self.db.execute(sql, tuple(params))
+            self.db.commit()
+            return cur
+        except Exception:
+            self.db.rollback()
+            raise
 
     # ------------------------------------------------------------------ pipelines
 
@@ -169,69 +180,63 @@ class CoreStore:
         definition_error: str | None = None,
     ) -> dict[str, Any]:
         ts = now_iso()
-        with self.conn:
-            self.conn.execute(
-                """
-                INSERT INTO pipelines (id, title, description, folder, stateful, enabled,
+        self._write(
+            """
+            INSERT INTO [[pipelines]] (id, title, description, folder, stateful, enabled,
                                        tags_json, definition_json, definition_error,
                                        last_seen_at, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    title = excluded.title,
-                    description = excluded.description,
-                    folder = excluded.folder,
-                    stateful = excluded.stateful,
-                    tags_json = excluded.tags_json,
-                    definition_json = excluded.definition_json,
-                    definition_error = excluded.definition_error,
-                    last_seen_at = excluded.last_seen_at,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    pipeline_id,
-                    title,
-                    description,
-                    folder,
-                    1 if stateful else 0,
-                    dumps(list(tags)),
-                    dumps(definition) if definition is not None else None,
-                    definition_error,
-                    ts,
-                    ts,
-                    ts,
-                ),
-            )
+            VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                title = excluded.title,
+                description = excluded.description,
+                folder = excluded.folder,
+                stateful = excluded.stateful,
+                tags_json = excluded.tags_json,
+                definition_json = excluded.definition_json,
+                definition_error = excluded.definition_error,
+                last_seen_at = excluded.last_seen_at,
+                updated_at = excluded.updated_at
+            """,
+            (
+                pipeline_id,
+                title,
+                description,
+                folder,
+                1 if stateful else 0,
+                dumps(list(tags)),
+                dumps(definition) if definition is not None else None,
+                definition_error,
+                ts,
+                ts,
+                ts,
+            ),
+        )
         return self.get_pipeline(pipeline_id)  # type: ignore[return-value]
 
     def get_pipeline(self, pipeline_id: str) -> dict[str, Any] | None:
-        row = self.conn.execute("SELECT * FROM pipelines WHERE id = ?", (pipeline_id,)).fetchone()
+        row = self.db.fetchone("SELECT * FROM [[pipelines]] WHERE id = ?", (pipeline_id,))
         return _pipeline_row(row) if row else None
 
     def list_pipelines(self) -> list[dict[str, Any]]:
-        rows = self.conn.execute("SELECT * FROM pipelines ORDER BY title COLLATE NOCASE").fetchall()
+        rows = self.db.fetchall("SELECT * FROM [[pipelines]] ORDER BY LOWER(title)")
         return [_pipeline_row(r) for r in rows]
 
     def set_pipeline_enabled(self, pipeline_id: str, enabled: bool) -> None:
-        with self.conn:
-            self.conn.execute(
-                "UPDATE pipelines SET enabled = ?, updated_at = ? WHERE id = ?",
-                (1 if enabled else 0, now_iso(), pipeline_id),
-            )
+        self._write(
+            "UPDATE [[pipelines]] SET enabled = ?, updated_at = ? WHERE id = ?",
+            (1 if enabled else 0, now_iso(), pipeline_id),
+        )
 
     def delete_pipeline(self, pipeline_id: str) -> None:
-        with self.conn:
-            self.conn.execute("DELETE FROM pipelines WHERE id = ?", (pipeline_id,))
+        self._write("DELETE FROM [[pipelines]] WHERE id = ?", (pipeline_id,))
 
     def prune_missing_pipelines(self, seen_ids: Iterable[str]) -> list[str]:
         """Remove registry rows for pipeline folders that no longer exist."""
         seen = set(seen_ids)
-        existing = {r["id"] for r in self.conn.execute("SELECT id FROM pipelines").fetchall()}
+        existing = {r["id"] for r in self.db.fetchall("SELECT id FROM [[pipelines]]")}
         gone = sorted(existing - seen)
-        if gone:
-            with self.conn:
-                self.conn.executemany(
-                    "DELETE FROM pipelines WHERE id = ?", [(pid,) for pid in gone]
-                )
+        for pid in gone:
+            self._write("DELETE FROM [[pipelines]] WHERE id = ?", (pid,))
         return gone
 
     # ----------------------------------------------------------------------- runs
@@ -246,20 +251,32 @@ class CoreStore:
         parent_run_id: int | None = None,
     ) -> dict[str, Any]:
         ts = now_iso()
-        with self.conn:
-            cur = self.conn.execute(
+        self.db.begin("immediate")
+        try:
+            run_id = self.db.insert(
                 """
-                INSERT INTO runs (pipeline_id, parent_run_id, status, mode, trigger,
-                                  params_json, created_at)
+                INSERT INTO [[runs]] (pipeline_id, parent_run_id, status, mode, trigger,
+                                      params_json, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (pipeline_id, parent_run_id, RunStatus.QUEUED, mode, trigger, dumps(params or {}), ts),
+                (
+                    pipeline_id,
+                    parent_run_id,
+                    RunStatus.QUEUED,
+                    mode,
+                    trigger,
+                    dumps(params or {}),
+                    ts,
+                ),
             )
-            run_id = int(cur.lastrowid)
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
         return self.get_run(run_id)  # type: ignore[return-value]
 
     def get_run(self, run_id: int) -> dict[str, Any] | None:
-        row = self.conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+        row = self.db.fetchone("SELECT * FROM [[runs]] WHERE id = ?", (run_id,))
         return _run_row(row) if row else None
 
     def list_runs(
@@ -270,7 +287,7 @@ class CoreStore:
         offset: int = 0,
         statuses: Iterable[str] | None = None,
     ) -> list[dict[str, Any]]:
-        sql = "SELECT * FROM runs"
+        sql = "SELECT * FROM [[runs]]"
         clauses: list[str] = []
         args: list[Any] = []
         if pipeline_id:
@@ -284,24 +301,24 @@ class CoreStore:
             sql += " WHERE " + " AND ".join(clauses)
         sql += " ORDER BY id DESC LIMIT ? OFFSET ?"
         args.extend([limit, offset])
-        return [_run_row(r) for r in self.conn.execute(sql, args).fetchall()]
+        return [_run_row(r) for r in self.db.fetchall(sql, args)]
 
     def active_run_for(self, pipeline_id: str) -> dict[str, Any] | None:
         placeholders = ",".join("?" * len(ACTIVE_STATUSES))
-        row = self.conn.execute(
-            f"SELECT * FROM runs WHERE pipeline_id = ? AND status IN ({placeholders}) "
+        row = self.db.fetchone(
+            f"SELECT * FROM [[runs]] WHERE pipeline_id = ? AND status IN ({placeholders}) "
             "ORDER BY id DESC LIMIT 1",
             (pipeline_id, *sorted(ACTIVE_STATUSES)),
-        ).fetchone()
+        )
         return _run_row(row) if row else None
 
     def last_finished_run(self, pipeline_id: str) -> dict[str, Any] | None:
         placeholders = ",".join("?" * len(TERMINAL_STATUSES))
-        row = self.conn.execute(
-            f"SELECT * FROM runs WHERE pipeline_id = ? AND status IN ({placeholders}) "
+        row = self.db.fetchone(
+            f"SELECT * FROM [[runs]] WHERE pipeline_id = ? AND status IN ({placeholders}) "
             "ORDER BY id DESC LIMIT 1",
             (pipeline_id, *sorted(TERMINAL_STATUSES)),
-        ).fetchone()
+        )
         return _run_row(row) if row else None
 
     def update_run(self, run_id: int, **fields: Any) -> dict[str, Any] | None:
@@ -311,10 +328,9 @@ class CoreStore:
             if json_field in fields and not isinstance(fields[json_field], str):
                 fields[json_field] = dumps(fields[json_field])
         assignments = ", ".join(f"{k} = ?" for k in fields)
-        with self.conn:
-            self.conn.execute(
-                f"UPDATE runs SET {assignments} WHERE id = ?", (*fields.values(), run_id)
-            )
+        self._write(
+            f"UPDATE [[runs]] SET {assignments} WHERE id = ?", (*fields.values(), run_id)
+        )
         return self.get_run(run_id)
 
     def finish_run(
@@ -336,7 +352,7 @@ class CoreStore:
             from datetime import datetime
 
             try:
-                t0 = datetime.fromisoformat(started.replace("Z", "+00:00"))
+                t0 = datetime.fromisoformat(str(started).replace("Z", "+00:00"))
                 t1 = datetime.fromisoformat(ts.replace("Z", "+00:00"))
                 duration = int((t1 - t0).total_seconds() * 1000)
             except ValueError:  # pragma: no cover
@@ -358,22 +374,27 @@ class CoreStore:
         return self.update_run(run_id, **fields)
 
     def signal(self, run_id: int, control: str | None) -> None:
-        with self.conn:
-            self.conn.execute(
-                "UPDATE runs SET control = ?, control_seq = control_seq + 1 WHERE id = ?",
-                (control, run_id),
-            )
+        self._write(
+            "UPDATE [[runs]] SET control = ?, control_seq = control_seq + 1 WHERE id = ?",
+            (control, run_id),
+        )
 
     def read_control(self, run_id: int) -> tuple[str | None, int]:
-        row = self.conn.execute(
-            "SELECT control, control_seq FROM runs WHERE id = ?", (run_id,)
-        ).fetchone()
+        row = self.db.fetchone(
+            "SELECT control, control_seq FROM [[runs]] WHERE id = ?", (run_id,)
+        )
         if row is None:
             return None, 0
         return row["control"], int(row["control_seq"])
 
-    def heartbeat(self, run_id: int, *, phase: str | None = None, done: int | None = None,
-                  total: int | None = None) -> None:
+    def heartbeat(
+        self,
+        run_id: int,
+        *,
+        phase: str | None = None,
+        done: int | None = None,
+        total: int | None = None,
+    ) -> None:
         fields: dict[str, Any] = {"heartbeat_at": now_iso()}
         if phase is not None:
             fields["phase"] = phase
@@ -382,18 +403,17 @@ class CoreStore:
         if total is not None:
             fields["progress_total"] = total
         assignments = ", ".join(f"{k} = ?" for k in fields)
-        with self.conn:
-            self.conn.execute(
-                f"UPDATE runs SET {assignments} WHERE id = ?", (*fields.values(), run_id)
-            )
+        self._write(
+            f"UPDATE [[runs]] SET {assignments} WHERE id = ?", (*fields.values(), run_id)
+        )
 
     def reap_stale_runs(self, *, alive_pids: set[int] | None = None) -> list[int]:
         """Mark runs that were active while the server died as crashed."""
         placeholders = ",".join("?" * len(ACTIVE_STATUSES))
-        rows = self.conn.execute(
-            f"SELECT id, pid FROM runs WHERE status IN ({placeholders})",
+        rows = self.db.fetchall(
+            f"SELECT id, pid FROM [[runs]] WHERE status IN ({placeholders})",
             tuple(sorted(ACTIVE_STATUSES)),
-        ).fetchall()
+        )
         reaped: list[int] = []
         for row in rows:
             pid = row["pid"]
@@ -415,10 +435,11 @@ class CoreStore:
         seq = fields.pop("seq", 0)
         if "metrics_json" in fields and not isinstance(fields["metrics_json"], str):
             fields["metrics_json"] = dumps(fields["metrics_json"])
-        with self.conn:
-            self.conn.execute(
+        self.db.begin("immediate")
+        try:
+            self.db.execute(
                 """
-                INSERT INTO run_steps (run_id, step, kind, version, seq)
+                INSERT INTO [[run_steps]] (run_id, step, kind, version, seq)
                 VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(run_id, step) DO NOTHING
                 """,
@@ -426,17 +447,21 @@ class CoreStore:
             )
             if fields:
                 assignments = ", ".join(f"{k} = ?" for k in fields)
-                self.conn.execute(
-                    f"UPDATE run_steps SET {assignments} WHERE run_id = ? AND step = ?",
+                self.db.execute(
+                    f"UPDATE [[run_steps]] SET {assignments} WHERE run_id = ? AND step = ?",
                     (*fields.values(), run_id, step),
                 )
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
 
     def list_steps(self, run_id: int) -> list[dict[str, Any]]:
-        rows = self.conn.execute(
-            "SELECT * FROM run_steps WHERE run_id = ? "
-            "ORDER BY IFNULL(started_at, '9999'), seq, step",
+        rows = self.db.fetchall(
+            "SELECT * FROM [[run_steps]] WHERE run_id = ? "
+            "ORDER BY COALESCE(started_at, '9999'), seq, step",
             (run_id,),
-        ).fetchall()
+        )
         out = []
         for row in rows:
             d = dict(row)
@@ -455,17 +480,17 @@ class CoreStore:
         message: str = "",
         data: dict[str, Any] | None = None,
     ) -> None:
-        with self.conn:
-            self.conn.execute(
-                "INSERT INTO run_events (run_id, ts, level, kind, message, data_json) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (run_id, now_iso(), level, kind, message, dumps(data) if data else None),
-            )
+        self._write(
+            "INSERT INTO [[run_events]] (run_id, ts, level, kind, message, data_json) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (run_id, now_iso(), level, kind, message, dumps(data) if data else None),
+        )
 
     def list_events(self, run_id: int, limit: int = 200) -> list[dict[str, Any]]:
-        rows = self.conn.execute(
-            "SELECT * FROM run_events WHERE run_id = ? ORDER BY id DESC LIMIT ?", (run_id, limit)
-        ).fetchall()
+        rows = self.db.fetchall(
+            "SELECT * FROM [[run_events]] WHERE run_id = ? ORDER BY id DESC LIMIT ?",
+            (run_id, limit),
+        )
         out = []
         for row in reversed(rows):
             d = dict(row)
@@ -476,26 +501,25 @@ class CoreStore:
     # ----------------------------------------------------------------- settings
 
     def get_setting(self, key: str, default: Any = None) -> Any:
-        row = self.conn.execute("SELECT value_json FROM settings WHERE key = ?", (key,)).fetchone()
+        row = self.db.fetchone("SELECT value_json FROM [[settings]] WHERE key = ?", (key,))
         return loads(row["value_json"], default) if row else default
 
     def set_setting(self, key: str, value: Any) -> None:
-        with self.conn:
-            self.conn.execute(
-                "INSERT INTO settings (key, value_json, updated_at) VALUES (?, ?, ?) "
-                "ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, "
-                "updated_at = excluded.updated_at",
-                (key, dumps(value), now_iso()),
-            )
+        self._write(
+            "INSERT INTO [[settings]] (key, value_json, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, "
+            "updated_at = excluded.updated_at",
+            (key, dumps(value), now_iso()),
+        )
 
     # -------------------------------------------------------------- aggregates
 
     def pipeline_stats(self, pipeline_id: str, window: int = 20) -> dict[str, Any]:
-        rows = self.conn.execute(
-            "SELECT status, duration_ms FROM runs WHERE pipeline_id = ? AND finished_at IS NOT NULL "
-            "ORDER BY id DESC LIMIT ?",
+        rows = self.db.fetchall(
+            "SELECT status, duration_ms FROM [[runs]] "
+            "WHERE pipeline_id = ? AND finished_at IS NOT NULL ORDER BY id DESC LIMIT ?",
             (pipeline_id, window),
-        ).fetchall()
+        )
         total = len(rows)
         succeeded = sum(1 for r in rows if r["status"] == RunStatus.SUCCEEDED)
         durations = [r["duration_ms"] for r in rows if r["duration_ms"]]
@@ -504,6 +528,19 @@ class CoreStore:
             "success_rate": round(succeeded / total, 3) if total else None,
             "avg_duration_ms": int(sum(durations) / len(durations)) if durations else None,
         }
+
+
+def _as_database(db: Database | str | Path | Target) -> Database:
+    """Accept an open database, a Target, or a bare SQLite path.
+
+    The path form keeps tests and one-off scripts short - a store pointed at a
+    file is simply a project whose target is that file.
+    """
+    if isinstance(db, Database):
+        return db
+    if isinstance(db, Target):
+        return connect(db)
+    return connect(Target(system="sqlite", path=Path(db)))
 
 
 def _synchronize(cls: type) -> type:
@@ -518,7 +555,11 @@ def _synchronize(cls: type) -> type:
         return inner
 
     for name, attr in list(vars(cls).items()):
-        if name.startswith("_") or not callable(attr) or isinstance(attr, (staticmethod, classmethod)):
+        if (
+            name.startswith("_")
+            or not callable(attr)
+            or isinstance(attr, (staticmethod, classmethod, property))
+        ):
             continue
         setattr(cls, name, wrap(attr))
     return cls
@@ -527,7 +568,7 @@ def _synchronize(cls: type) -> type:
 _synchronize(CoreStore)
 
 
-def _pipeline_row(row: sqlite3.Row) -> dict[str, Any]:
+def _pipeline_row(row: Any) -> dict[str, Any]:
     d = dict(row)
     d["stateful"] = bool(d.get("stateful"))
     d["enabled"] = bool(d.get("enabled"))
@@ -536,7 +577,7 @@ def _pipeline_row(row: sqlite3.Row) -> dict[str, Any]:
     return d
 
 
-def _run_row(row: sqlite3.Row) -> dict[str, Any]:
+def _run_row(row: Any) -> dict[str, Any]:
     d = dict(row)
     d["params"] = loads(d.pop("params_json", None), {})
     d["metrics"] = loads(d.pop("metrics_json", None), {})

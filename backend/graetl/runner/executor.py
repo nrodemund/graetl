@@ -87,6 +87,7 @@ class Executor:
             mode=self.mode,
             dir=Path(self.loaded.folder),
             config=self.loaded.config,
+            files_root=self.settings.files_root,
             params=self.params,
             stateful=self.pipeline.stateful,
             _emit=self._emit_from_ctx,
@@ -122,7 +123,7 @@ class Executor:
         sampler.start()
         try:
             if pipeline.stateful:
-                self.state = StateStore(self.settings.state_db_path(pipeline.id))
+                self.state = self.settings.state_store(pipeline.id)
                 ctx._state = self.state
                 healed = self.state.reset_stale_running()
                 if healed:
@@ -511,7 +512,7 @@ class Executor:
     ) -> None:
         """One module, one worker: own connection, own context, exclusive lock."""
         t0 = time.perf_counter()
-        state = StateStore(self.settings.state_db_path(self.pipeline.id))
+        state = self.settings.state_store(self.pipeline.id)
         ctx = self._module_context(base_ctx, module, state)
         try:
             try:
@@ -552,6 +553,7 @@ class Executor:
             mode=base.mode,
             dir=base.dir,
             config=base.config,
+            files_root=base.files_root,
             params=base.params,
             resources=base.resources,  # shared on purpose: values put there by setup()
             stateful=base.stateful,

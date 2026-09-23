@@ -1,7 +1,8 @@
 """Cooperative pause/stop for a running pipeline process.
 
-The server never kills a run to pause it. It writes a control word into
-``runs.control`` in ``etl.db``; this watcher picks it up and flips an
+The server never kills a run to pause it. It writes a control word into the
+``control`` column of the run's row in the project's target database; this
+watcher picks it up on its own connection and flips a
 ``threading.Event``. The executor checks that flag at safe points (between
 entities, between modules, and wherever pipeline code calls
 ``ctx.checkpoint()``), so state is always consistent.
@@ -12,10 +13,9 @@ A hard kill remains available as a last resort (stop grace period elapsed).
 from __future__ import annotations
 
 import threading
-from pathlib import Path
 from typing import Callable
 
-from graetl.store.sqlite import connect
+from graetl.store.db import Target, connect
 
 
 class ControlWatcher:
@@ -23,13 +23,13 @@ class ControlWatcher:
 
     def __init__(
         self,
-        core_db_path: str | Path,
+        target: Target,
         run_id: int,
         *,
         poll_seconds: float = 0.5,
         on_change: Callable[[str], None] | None = None,
     ) -> None:
-        self.core_db_path = Path(core_db_path)
+        self.target = target
         self.run_id = run_id
         self.poll_seconds = poll_seconds
         self.on_change = on_change
@@ -64,17 +64,17 @@ class ControlWatcher:
     # ---------------------------------------------------------------- polling
 
     def _loop(self) -> None:
-        conn = None
+        db = None
         try:
-            conn = connect(self.core_db_path, readonly=True)
+            db = connect(self.target)
         except Exception:  # pragma: no cover - db not reachable; run uncontrolled
             return
         try:
             while not self._shutdown.wait(self.poll_seconds):
                 try:
-                    row = conn.execute(
-                        "SELECT control, control_seq FROM runs WHERE id = ?", (self.run_id,)
-                    ).fetchone()
+                    row = db.fetchone(
+                        "SELECT control, control_seq FROM [[runs]] WHERE id = ?", (self.run_id,)
+                    )
                 except Exception:  # pragma: no cover
                     continue
                 if row is None:
@@ -85,8 +85,8 @@ class ControlWatcher:
                 self._last_seq = seq
                 self.apply(row["control"])
         finally:
-            if conn is not None:
-                conn.close()
+            if db is not None:
+                db.close()
 
     def apply(self, control: str | None) -> None:
         if control == "pause":

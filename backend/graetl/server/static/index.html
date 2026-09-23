@@ -17,6 +17,7 @@
         <div class="brand-sub" id="brand-sub">connecting…</div>
       </div>
     </div>
+    <div class="project" id="project" hidden></div>
     <nav class="nav">
       <a class="nav-item" href="#/" data-nav="dashboard"><span class="ico">▤</span> Dashboard</a>
       <a class="nav-item" href="#/runs" data-nav="runs"><span class="ico">⟳</span> Runs</a>
@@ -44,6 +45,8 @@
     </div>
   </div>
 </div>
+<!-- Shown instead of the shell when this instance has no project open yet. -->
+<div class="picker" id="picker" hidden></div>
 <div class="toasts" id="toasts"></div>
 <script type="module" src="/app.js"></script>
 </body>

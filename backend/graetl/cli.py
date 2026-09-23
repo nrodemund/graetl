@@ -9,6 +9,7 @@ from pathlib import Path
 
 from graetl import __version__
 from graetl.config import CONFIG_FILENAME, MONACO_VERSION, load_settings
+from graetl.project import Project, ProjectError, recent_projects, remember_project
 from graetl.loader import (
     discover_folders,
     inspect_folder,
@@ -30,10 +31,16 @@ LEVEL_COLORS = {
 }
 RESET = "\033[0m"
 
-DEFAULT_CONFIG = """# GraETL project configuration
+DEFAULT_CONFIG = """# GraETL instance configuration.
+# This file belongs to the installation, not to any one project: a project
+# (a data warehouse) carries its own project.toml and its own git repository.
 [server]
 host = "127.0.0.1"
 port = 8777
+
+[project]
+# The project this instance opens when none is given on the command line.
+# path = "../warehouse-sicdb"
 
 [runtime]
 log_retention_runs = 50
@@ -88,36 +95,158 @@ class ConsoleWriter(EventWriter):
 
 
 def cmd_init(args: argparse.Namespace) -> int:
+    """Write an instance configuration. Projects are made with new-project."""
     root = Path(args.path or ".").resolve()
     root.mkdir(parents=True, exist_ok=True)
     cfg = root / CONFIG_FILENAME
     if not cfg.exists():
         cfg.write_text(DEFAULT_CONFIG, encoding="utf-8")
-    settings = load_settings(root)
-    settings.ensure_dirs()
-    CoreStore(settings.core_db_path).close()
-    print(f"GraETL project initialised at {root}")
-    print(f"  config    {cfg}")
-    print(f"  pipelines {settings.pipelines_dir}")
-    print(f"  database  {settings.core_db_path}")
+    print(f"GraETL instance configured at {root}")
+    print(f"  config  {cfg}")
+    print("Create a warehouse with: graetl new-project <folder>")
+    return 0
+
+
+def cmd_new_project(args: argparse.Namespace) -> int:
+    root = Path(args.path).resolve()
+    try:
+        project = Project.create(
+            root,
+            name=args.name,
+            title=args.title or "",
+            system=args.target,
+            dsn=args.dsn or "",
+            schema=args.schema,
+        )
+    except ProjectError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    # A project is data, and data wants history: the target and produced files
+    # are already ignored by the generated .gitignore.
+    if not args.no_git and not (root / ".git").exists():
+        import subprocess
+
+        try:
+            subprocess.run(["git", "init", "-q", "-b", "main"], cwd=root, check=True)
+            print("  git       initialised (nothing committed yet)")
+        except (OSError, subprocess.CalledProcessError):
+            print("  git       not initialised (git unavailable)")
+
+    settings = load_settings(args.root, project=root)
+    try:
+        store = settings.core_store()
+        store.close()
+        reachable = f"ready ({project.target.describe()})"
+    except Exception as exc:  # noqa: BLE001 - the target may legitimately be down
+        reachable = f"NOT reachable yet: {exc}"
+    remember_project(project)
+    print(f"GraETL project created at {root}")
+    print(f"  config    {project.config_path}")
+    print(f"  pipelines {project.pipelines_dir}")
+    print(f"  files     {project.files_root}")
+    print(f"  target    {reachable}")
+    return 0
+
+
+def cmd_import_legacy(args: argparse.Namespace) -> int:
+    """Bring a pre-project installation's pipelines folder into a project."""
+    from graetl.migrate import describe_legacy, import_legacy
+
+    settings = load_settings(args.root, project=args.project, require_project=True)
+    project = settings.require_project()
+    found = describe_legacy(args.old)
+    if not found["pipelines"] and not found["core_db"]:
+        print(f"nothing to import from {found['root']}", file=sys.stderr)
+        return 1
+    print(f"Importing {found['root']} into {project.title} ({project.target.describe()})")
+    for entry in found["pipelines"]:
+        print(f"  {entry['id']:<24} {entry['entities']:>9} entities  "
+              f"{entry['bytes'] / 1e6:>8.1f} MB  "
+              f"{len(entry['data_tables'])} data table(s)")
+    if args.dry_run:
+        print("(dry run - nothing was written)")
+    report = import_legacy(
+        args.old, project, move_data=not args.no_data, dry_run=args.dry_run
+    )
+    print()
+    for line in report.lines():
+        print("  " + line)
+    if report.collisions:
+        print("\nSome table names appeared in more than one pipeline and were left alone;"
+              "\nrename them in the old folder and import again.", file=sys.stderr)
+        return 2
+    return 0
+
+
+def cmd_projects(args: argparse.Namespace) -> int:
+    entries = recent_projects()
+    if not entries:
+        print("No projects opened yet. Create one with: graetl new-project <folder>")
+        return 0
+    for entry in entries:
+        print(f"{entry.get('title') or entry.get('name'):<32} "
+              f"{entry.get('target', '?'):<9} {entry['root']}")
+    return 0
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Say what this instance is, what it has open, and whether it works."""
+    settings = load_settings(args.root, project=args.project)
+    print(f"GraETL {__version__}")
+    print(f"  instance  {settings.root}")
+    if not settings.has_project:
+        print("  project   none open")
+        print("            pass one to `graetl serve <project>` or set GRAETL_PROJECT")
+        return 1
+    project = settings.project
+    assert project is not None
+    print(f"  project   {project.title} ({project.root})")
+    print(f"  pipelines {project.pipelines_dir}")
+    print(f"  files     {project.files_root}")
+    print(f"  target    {project.target.describe()}")
+    if project.target.is_postgres:
+        from graetl.store.db import postgres_driver
+
+        try:
+            _module, name = postgres_driver()
+            note = "" if name != "pgwire" else "  (bundled fallback; pip install psycopg for more)"
+            print(f"  driver    {name}{note}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  driver    unavailable: {exc}")
+    try:
+        store = settings.core_store()
+        n = len(store.list_pipelines())
+        store.close()
+        print(f"  database  reachable, {n} pipeline(s) registered")
+    except Exception as exc:  # noqa: BLE001
+        print(f"  database  UNREACHABLE: {exc}")
+        return 1
     return 0
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
     import uvicorn
 
-    settings = load_settings(args.root)
+    settings = load_settings(
+        args.root, project=getattr(args, "project_path", None) or args.project
+    )
     from graetl.server.app import create_app
 
     host = args.host or settings.host
     port = args.port or settings.port
     print(f"GraETL {__version__} - http://{host}:{port}")
+    if settings.project is not None:
+        print(f"  project {settings.project.title} - {settings.project.root}")
+        print(f"  target  {settings.project.target.describe()}")
+    else:
+        print("  no project open - choose one in the browser")
     uvicorn.run(create_app(settings), host=host, port=port, log_level=args.log_level)
     return 0
 
 
 def cmd_list(args: argparse.Namespace) -> int:
-    settings = load_settings(args.root)
+    settings = load_settings(args.root, project=args.project)
     folders = discover_folders(settings)
     if not folders:
         print(f"No pipelines found in {settings.pipelines_dir}")
@@ -137,7 +266,7 @@ def cmd_list(args: argparse.Namespace) -> int:
 
 
 def cmd_new(args: argparse.Namespace) -> int:
-    settings = load_settings(args.root)
+    settings = load_settings(args.root, project=args.project)
     folder = scaffold_pipeline(
         settings,
         args.id,
@@ -150,7 +279,7 @@ def cmd_new(args: argparse.Namespace) -> int:
 
 
 def cmd_new_module(args: argparse.Namespace) -> int:
-    settings = load_settings(args.root)
+    settings = load_settings(args.root, project=args.project)
     pipeline_dir = settings.pipeline_dir(args.pipeline)
     if not pipeline_dir.is_dir():
         print(f"no such pipeline: {args.pipeline}")
@@ -161,7 +290,7 @@ def cmd_new_module(args: argparse.Namespace) -> int:
 
 
 def cmd_inspect(args: argparse.Namespace) -> int:
-    settings = load_settings(args.root)
+    settings = load_settings(args.root, project=args.project)
     info = inspect_folder(settings.pipeline_dir(args.id), pipeline_id=args.id)
     print(json.dumps(info, indent=2))
     return 0 if info.get("ok") else 1
@@ -169,8 +298,8 @@ def cmd_inspect(args: argparse.Namespace) -> int:
 
 def cmd_run(args: argparse.Namespace) -> int:
     """Run a pipeline in the foreground (developer mode - same process)."""
-    settings = load_settings(args.root)
-    store = CoreStore(settings.core_db_path)
+    settings = load_settings(args.root, project=args.project)
+    store = settings.core_store()
     try:
         loaded = load_pipeline(settings.pipeline_dir(args.id), pipeline_id=args.id)
         store.upsert_pipeline(
@@ -216,8 +345,8 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 
 def cmd_runs(args: argparse.Namespace) -> int:
-    settings = load_settings(args.root)
-    store = CoreStore(settings.core_db_path)
+    settings = load_settings(args.root, project=args.project)
+    store = settings.core_store()
     try:
         for run in store.list_runs(pipeline_id=args.id, limit=args.limit):
             print(
@@ -231,12 +360,8 @@ def cmd_runs(args: argparse.Namespace) -> int:
 
 
 def cmd_state(args: argparse.Namespace) -> int:
-    settings = load_settings(args.root)
-    path = settings.state_db_path(args.id)
-    if not path.exists():
-        print(f"No state database for {args.id} (stateless pipeline or never run).")
-        return 0
-    with StateStore(path) as state:
+    settings = load_settings(args.root, project=args.project)
+    with settings.state_store(args.id) as state:
         print(f"entities: {state.count_entities()}")
         for row in state.module_summary():
             parts = ", ".join(f"{k}={v}" for k, v in row.items() if k not in ("module", "total"))
@@ -245,12 +370,8 @@ def cmd_state(args: argparse.Namespace) -> int:
 
 
 def cmd_reset(args: argparse.Namespace) -> int:
-    settings = load_settings(args.root)
-    path = settings.state_db_path(args.id)
-    if not path.exists():
-        print("nothing to reset")
-        return 0
-    with StateStore(path) as state:
+    settings = load_settings(args.root, project=args.project)
+    with settings.state_store(args.id) as state:
         if args.module:
             n = state.reset_module(args.module)
             print(f"reset {n} state row(s) for module {args.module}")
@@ -337,7 +458,7 @@ def cmd_compile(args: argparse.Namespace) -> int:
     from graetl.config import load_pipeline_config
     from graetl.graph.build import build_pipeline_graphs, clean_generated
 
-    settings = load_settings(args.root)
+    settings = load_settings(args.root, project=args.project)
     folder = settings.pipeline_dir(args.id)
     if not folder.is_dir():
         print(f"no such pipeline: {args.id}")
@@ -384,7 +505,7 @@ def cmd_graph(args: argparse.Namespace) -> int:
     from graetl.config import load_pipeline_config
     from graetl.graph.build import compile_one_graph
 
-    settings = load_settings(args.root)
+    settings = load_settings(args.root, project=args.project)
     folder = settings.pipeline_dir(args.id)
     path = folder / args.path
     if not path.is_file():
@@ -409,14 +530,46 @@ def cmd_graph(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="graetl", description="GraETL command line")
     parser.add_argument("--version", action="version", version=f"GraETL {__version__}")
-    parser.add_argument("--root", default=None, help="project root (default: auto-detect)")
+    parser.add_argument("--root", default=None, help="instance root (holds graetl.toml)")
+    parser.add_argument(
+        "--project", default=None, help="project folder (holds project.toml)"
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p = sub.add_parser("init", help="initialise a project folder")
+    p = sub.add_parser("new-project", help="create a warehouse project folder")
+    p.add_argument("path")
+    p.add_argument("--name", default=None)
+    p.add_argument("--title", default=None)
+    p.add_argument("--target", default="sqlite", choices=["sqlite", "postgres"])
+    p.add_argument("--dsn", default=None, help="libpq DSN when --target postgres")
+    p.add_argument("--schema", default="graetl", help="schema for GraETL's own tables")
+    p.add_argument("--no-git", action="store_true", help="skip git init")
+    p.set_defaults(func=cmd_new_project)
+
+    p = sub.add_parser(
+        "import-legacy", help="import a pre-project pipelines folder into this project"
+    )
+    p.add_argument("old", help="the old pipelines/ folder")
+    p.add_argument("--no-data", action="store_true",
+                   help="bookkeeping only; leave the warehouse tables behind")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(func=cmd_import_legacy)
+
+    p = sub.add_parser("projects", help="list recently opened projects")
+    p.set_defaults(func=cmd_projects)
+
+    p = sub.add_parser("doctor", help="report instance, project and target health")
+    p.set_defaults(func=cmd_doctor)
+
+    p = sub.add_parser("init", help="write an instance configuration file")
     p.add_argument("path", nargs="?", default=".")
     p.set_defaults(func=cmd_init)
 
     p = sub.add_parser("serve", help="start the GraETL server + UI")
+    # Positional, because "serve this warehouse" is the common case. Omit it and
+    # the console shows the project picker.
+    p.add_argument("project_path", nargs="?", default=None,
+                   help="project folder (holds project.toml); omit to pick one in the UI")
     p.add_argument("--host", default=None)
     p.add_argument("--port", type=int, default=None)
     p.add_argument("--log-level", default="info")

@@ -1,13 +1,13 @@
 """The context object handed to every pipeline callback.
 
 ``ctx`` is the single door into everything the runtime offers: configuration,
-paths, the pipeline's own SQLite connection, structured logging that streams
-into the GraETL console, metrics/profiling, and cooperative pause/stop.
+paths, the project's target database, the project file root, structured logging
+that streams into the GraETL console, metrics/profiling, and cooperative
+pause/stop.
 """
 
 from __future__ import annotations
 
-import sqlite3
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -38,6 +38,8 @@ class Context:
     mode: str
     dir: Path
     config: dict[str, Any]
+    #: The project's target file root - where produced files belong.
+    files_root: Path | None = None
     params: dict[str, Any] = field(default_factory=dict)
     resources: dict[str, Any] = field(default_factory=dict)
     stateful: bool = False
@@ -73,6 +75,29 @@ class Context:
         """Resolve a path relative to the pipeline folder."""
         return self.dir.joinpath(*parts)
 
+    def file(self, *parts: str, mkdir: bool = True) -> Path:
+        """A path under the **project's** file root, for files a module produces.
+
+        This is where DICOM series, exports and attachments belong: one place
+        per warehouse, outside any pipeline folder, configured as ``[files]
+        root`` in ``project.toml``. Unlike :meth:`path`, it refuses to escape
+        its root - the name usually comes from source data, and a ``..`` in a
+        study identifier must not be able to write anywhere it likes.
+
+            path = ctx.file("dicom", study_id, f"{series}.dcm")
+        """
+        if self.files_root is None:
+            raise RuntimeError(
+                "this pipeline has no project file root - set [files] root in project.toml"
+            )
+        base = Path(self.files_root).resolve()
+        candidate = base.joinpath(*[str(p) for p in parts]).resolve()
+        if candidate != base and base not in candidate.parents:
+            raise ValueError(f"{Path(*[str(p) for p in parts])} resolves outside the file root")
+        if mkdir:
+            candidate.parent.mkdir(parents=True, exist_ok=True)
+        return candidate
+
     # ------------------------------------------------------------------- data
 
     @property
@@ -86,11 +111,14 @@ class Context:
         return self._state
 
     @property
-    def db(self) -> sqlite3.Connection:
-        """The pipeline state database connection.
+    def db(self) -> Any:
+        """The project's target database - where this pipeline writes.
 
         Writes made here inside a module commit atomically together with the
-        entity's state row.
+        entity's state row, because GraETL's bookkeeping lives in the same
+        database. ``?`` placeholders and ``execute``/``fetchone``/``fetchall``
+        work the same whether the target is SQLite or PostgreSQL, so module
+        code does not care which it is.
         """
         return self.state.conn
 

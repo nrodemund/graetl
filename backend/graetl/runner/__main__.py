@@ -3,7 +3,7 @@
 Started by the GraETL server as a *separate OS process* so that pipeline code
 can never take the server down:
 
-    python -m graetl.runner run --root <project> --pipeline <id> --run-id <n>
+    python -m graetl.runner run --project <folder> --pipeline <id> --run-id <n>
 
 It also serves the cheap ``inspect`` mode used to read a pipeline definition
 without executing anything in the server process.
@@ -39,7 +39,7 @@ def _heartbeat_loop(writer: EventWriter, interval: float, stop: threading.Event)
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    settings = load_settings(args.root)
+    settings = load_settings(args.root, project=args.project, require_project=True)
     # Cached pipeline functions size themselves from configuration, before any
     # pipeline code is imported.
     from graetl.sdk import caching
@@ -56,7 +56,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     params = json.loads(args.params) if args.params else {}
     stop_heartbeat = threading.Event()
     control = ControlWatcher(
-        settings.core_db_path,
+        settings.target,
         args.run_id,
         poll_seconds=settings.control_poll_seconds,
         on_change=lambda what: writer.emit(
@@ -167,7 +167,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     run = sub.add_parser("run", help="execute one run of a pipeline")
-    run.add_argument("--root", default=None, help="project root (contains pipelines/)")
+    run.add_argument("--root", default=None, help="instance root (holds graetl.toml)")
+    run.add_argument("--project", default=None, help="project folder (holds project.toml)")
     run.add_argument("--pipeline", required=True)
     run.add_argument("--run-id", type=int, required=True)
     run.add_argument("--mode", default="incremental",

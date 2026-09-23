@@ -52,6 +52,13 @@ from graetl.server.schemas import (
     PreviewGraphRequest,
     WriteGraphRequest,
 )
+from graetl.project import (
+    Project,
+    ProjectError,
+    forget_project,
+    recent_projects,
+    remember_project,
+)
 from graetl.server.supervisor import Supervisor, SupervisorError
 from graetl.store.core import CoreStore
 from graetl.store.state import StateStore
@@ -100,13 +107,57 @@ async def _body(request: Request, model: type) -> Any:
         raise HTTPException(status_code=400, detail="invalid JSON body") from exc
 
 
+class _Deferred:
+    """Stands in for the store or supervisor until a project is open.
+
+    One instance opens one project, but it may be started without one - the
+    console then shows the project picker. Every endpoint that needs a
+    warehouse reaches it through one of these and gets a clean 503 until one is
+    chosen, instead of the server refusing to start at all.
+    """
+
+    def __init__(self, what: str) -> None:
+        self._what = what
+        self._real: Any = None
+
+    def bind(self, real: Any) -> None:
+        self._real = real
+
+    def unbind(self) -> Any:
+        real, self._real = self._real, None
+        return real
+
+    @property
+    def ready(self) -> bool:
+        return self._real is not None
+
+    def __getattr__(self, name: str) -> Any:
+        if self._real is None:
+            raise HTTPException(
+                status_code=503,
+                detail="no GraETL project is open - choose one first",
+            )
+        return getattr(self._real, name)
+
+
 def create_app(settings: Settings | None = None) -> Starlette:
     settings = settings or load_settings()
-    settings.ensure_dirs()
 
-    store = CoreStore(settings.core_db_path)
+    store = _Deferred("store")
+    supervisor = _Deferred("supervisor")
     hub = EventHub(buffer_size=settings.console_buffer_lines)
-    supervisor = Supervisor(settings, store, hub)
+
+    def open_project(project: Project) -> None:
+        """Bind this instance to a project. Called once, at startup or by the picker."""
+        settings.project = project
+        settings.ensure_dirs()
+        real_store = settings.core_store()
+        store.bind(real_store)
+        supervisor.bind(Supervisor(settings, real_store, hub))
+        remember_project(project)
+
+    if settings.has_project:
+        open_project(settings.require_project())
 
     # ----------------------------------------------------------- helpers
 
@@ -130,11 +181,8 @@ def create_app(settings: Settings | None = None) -> Starlette:
         return target
 
     def state_summary(pipeline_id: str) -> dict[str, Any]:
-        path = settings.state_db_path(pipeline_id)
-        if not path.exists():
-            return {"entities": 0, "modules": [], "statuses": {}}
         try:
-            with StateStore(path) as state:
+            with settings.state_store(pipeline_id) as state:
                 return {
                     "entities": state.count_entities(),
                     "modules": state.module_summary(),
@@ -176,9 +224,11 @@ def create_app(settings: Settings | None = None) -> Starlette:
                 "ok": True,
                 "version": __version__,
                 "root": str(settings.root),
-                "pipelines_dir": str(settings.pipelines_dir),
-                "database": str(settings.core_db_path),
-                "active_runs": len(supervisor.processes),
+                "project": settings.project.to_dict() if settings.project else None,
+                "project_open": store.ready,
+                "pipelines_dir": str(settings.pipelines_dir) if settings.has_project else None,
+                "database": settings.target.describe() if settings.has_project else None,
+                "active_runs": len(supervisor.processes) if supervisor.ready else 0,
                 "ui": "builtin",
                 # Where the browser should load the code editor from. A vendored
                 # copy wins; otherwise the configured URL (empty = offline
@@ -925,11 +975,9 @@ def create_app(settings: Settings | None = None) -> Starlette:
         migrated = 0
         renames = [(a, b) for a, b in zip(before, after) if a != b]
         if body.migrate_state and renames:
-            state_path = settings.state_db_path(pid)
-            if state_path.exists():
-                with StateStore(state_path) as state:
-                    for old_name, new_name in renames:
-                        migrated += state.rename_module(old_name, new_name)
+            with settings.state_store(pid) as state:
+                for old_name, new_name in renames:
+                    migrated += state.rename_module(old_name, new_name)
 
         build = _rebuild_graphs(pid)
         await asyncio.to_thread(supervisor.sync_pipelines)
@@ -979,11 +1027,9 @@ def create_app(settings: Settings | None = None) -> Starlette:
 
         dropped = 0
         if modules:
-            state_path = settings.state_db_path(pid)
-            if state_path.exists():
-                with StateStore(state_path) as state:
-                    for name in modules:
-                        dropped += state.drop_module(name)
+            with settings.state_store(pid) as state:
+                for name in modules:
+                    dropped += state.drop_module(name)
 
         build = _rebuild_graphs(pid)
         await asyncio.to_thread(supervisor.sync_pipelines)
@@ -1034,15 +1080,12 @@ def create_app(settings: Settings | None = None) -> Starlette:
     async def list_entities(request: Request) -> Response:
         pid = request.path_params["pipeline_id"]
         require_pipeline(pid)
-        path = settings.state_db_path(pid)
-        if not path.exists():
-            return _json({"total": 0, "entities": [], "modules": []})
         search = _qp(request, "search")
         status = _qp(request, "status")
         module = _qp(request, "module")
         limit = min(int(_qp(request, "limit", 100, int)), 2000)
         offset = int(_qp(request, "offset", 0, int))
-        with StateStore(path) as state:
+        with settings.state_store(pid) as state:
             return _json(
                 {
                     "total": state.count_entities(),
@@ -1068,10 +1111,7 @@ def create_app(settings: Settings | None = None) -> Starlette:
         pid = request.path_params["pipeline_id"]
         entity_id = request.path_params["entity_id"]
         require_pipeline(pid)
-        path = settings.state_db_path(pid)
-        if not path.exists():
-            raise HTTPException(status_code=404, detail="no state database")
-        with StateStore(path) as state:
+        with settings.state_store(pid) as state:
             entity = state.get_entity(entity_id)
         if entity is None:
             raise HTTPException(status_code=404, detail="unknown entity")
@@ -1084,10 +1124,7 @@ def create_app(settings: Settings | None = None) -> Starlette:
         if store.active_run_for(pid):
             raise HTTPException(status_code=409, detail="cannot reset while a run is active")
         body: ResetEntityRequest = await _body(request, ResetEntityRequest)
-        path = settings.state_db_path(pid)
-        if not path.exists():
-            raise HTTPException(status_code=404, detail="no state database")
-        with StateStore(path) as state:
+        with settings.state_store(pid) as state:
             removed = state.reset_entity(entity_id, body.module)
             entity = state.get_entity(entity_id)
         return _json({"ok": True, "reset": removed, "entity": entity})
@@ -1098,10 +1135,7 @@ def create_app(settings: Settings | None = None) -> Starlette:
         if store.active_run_for(pid):
             raise HTTPException(status_code=409, detail="cannot reset state while a run is active")
         body: ResetStateRequest = await _body(request, ResetStateRequest)
-        path = settings.state_db_path(pid)
-        if not path.exists():
-            return _json({"ok": True, "reset": 0})
-        with StateStore(path) as state:
+        with settings.state_store(pid) as state:
             if body.module:
                 n = state.reset_module(body.module)
             else:
@@ -1270,8 +1304,134 @@ def create_app(settings: Settings | None = None) -> Starlette:
 
     # ----------------------------------------------------------------- routes
 
+    # ------------------------------------------------------------- project
+
+    async def project_info(request: Request) -> Response:
+        """What the console needs to draw the header - or the picker."""
+        if not settings.has_project:
+            return _json({"open": False, "recent": recent_projects()})
+        project = settings.require_project()
+        payload = project.to_dict()
+        payload["open"] = store.ready
+        try:
+            store.list_pipelines()
+            payload["target"]["reachable"] = True
+        except Exception as exc:  # noqa: BLE001 - shown to the user verbatim
+            payload["target"]["reachable"] = False
+            payload["target"]["error"] = str(exc)
+        return _json(payload)
+
+    async def project_logo(request: Request) -> Response:
+        path = settings.project.logo_path if settings.has_project else None
+        if path is None:
+            raise HTTPException(status_code=404, detail="this project has no logo")
+        return FileResponse(path)
+
+    async def project_recent(request: Request) -> Response:
+        return _json({"recent": recent_projects()})
+
+    async def project_open(request: Request) -> Response:
+        """Finish startup by choosing a project.
+
+        A GraETL instance opens exactly one project, so this only ever
+        completes an instance that started without one; swapping projects means
+        restarting.
+        """
+        if store.ready:
+            raise HTTPException(
+                status_code=409,
+                detail="this instance already has a project open - restart to change it",
+            )
+        body = await request.json()
+        path = str((body or {}).get("path") or "").strip()
+        if not path:
+            raise HTTPException(status_code=400, detail="path is required")
+        try:
+            project = Project.load(path)
+        except ProjectError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        try:
+            open_project(project)
+        except Exception as exc:  # noqa: BLE001 - usually the target being down
+            settings.project = None
+            store.unbind()
+            supervisor.unbind()
+            raise HTTPException(
+                status_code=502, detail=f"could not open the target database: {exc}"
+            ) from exc
+        supervisor.bind_loop(asyncio.get_running_loop())
+        await asyncio.to_thread(supervisor.sync_pipelines)
+        return _json(project.to_dict())
+
+    async def project_create(request: Request) -> Response:
+        body = await request.json() or {}
+        try:
+            project = Project.create(
+                str(body.get("path") or ""),
+                name=body.get("name") or None,
+                title=str(body.get("title") or ""),
+                system=str(body.get("system") or "sqlite"),
+                dsn=str(body.get("dsn") or ""),
+                schema=str(body.get("schema") or "graetl"),
+            )
+        except ProjectError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except OSError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if not store.ready:
+            try:
+                open_project(project)
+            except Exception as exc:  # noqa: BLE001
+                settings.project = None
+                store.unbind()
+                supervisor.unbind()
+                raise HTTPException(
+                    status_code=502, detail=f"created, but the target is unreachable: {exc}"
+                ) from exc
+            supervisor.bind_loop(asyncio.get_running_loop())
+        return _json(project.to_dict(), status_code=201)
+
+    async def project_forget(request: Request) -> Response:
+        body = await request.json() or {}
+        forget_project(str(body.get("path") or ""))
+        return _json({"ok": True, "recent": recent_projects()})
+
+    async def project_browse(request: Request) -> Response:
+        """List folders so the picker can walk the disk without a native dialog."""
+        raw = _qp(request, "path") or ""
+        base = Path(raw).expanduser() if raw else Path.home()
+        try:
+            base = base.resolve()
+            entries = sorted(
+                (p for p in base.iterdir() if p.is_dir() and not p.name.startswith(".")),
+                key=lambda p: p.name.lower(),
+            )
+        except OSError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return _json(
+            {
+                "path": str(base),
+                "parent": str(base.parent) if base.parent != base else None,
+                "entries": [
+                    {
+                        "name": p.name,
+                        "path": str(p),
+                        "project": (p / "project.toml").exists(),
+                    }
+                    for p in entries[:500]
+                ],
+            }
+        )
+
     routes = [
         Route("/api/health", health),
+        Route("/api/project", project_info),
+        Route("/api/project/logo", project_logo),
+        Route("/api/project/open", project_open, methods=["POST"]),
+        Route("/api/project/create", project_create, methods=["POST"]),
+        Route("/api/project/forget", project_forget, methods=["POST"]),
+        Route("/api/project/browse", project_browse),
+        Route("/api/projects/recent", project_recent),
         Route("/api/overview", overview),
         Route("/api/pipelines", list_pipelines),
         Route("/api/pipelines", create_pipeline, methods=["POST"]),
@@ -1328,17 +1488,21 @@ def create_app(settings: Settings | None = None) -> Starlette:
 
     @asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
-        supervisor.bind_loop(asyncio.get_running_loop())
-        for run_id in store.reap_stale_runs():
-            store.add_event(
-                run_id, kind="status", level="warning", message="Marked as crashed at startup."
-            )
-        await asyncio.to_thread(supervisor.sync_pipelines)
+        # Without a project there is nothing to reap or sync yet; the console
+        # shows the picker and project_open() does this work when one is chosen.
+        if store.ready:
+            supervisor.bind_loop(asyncio.get_running_loop())
+            for run_id in store.reap_stale_runs():
+                store.add_event(
+                    run_id, kind="status", level="warning", message="Marked as crashed at startup."
+                )
+            await asyncio.to_thread(supervisor.sync_pipelines)
         try:
             yield
         finally:
-            await asyncio.to_thread(supervisor.shutdown)
-            store.close()
+            if store.ready:
+                await asyncio.to_thread(supervisor.shutdown)
+                store.close()
 
     async def http_exception(request: Request, exc: HTTPException) -> Response:
         return _json({"detail": exc.detail}, status_code=exc.status_code)

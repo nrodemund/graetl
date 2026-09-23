@@ -1,13 +1,22 @@
-# GraETL project configuration
+# GraETL instance configuration.
+#
+# This file belongs to the *installation*, not to any one warehouse. A project
+# (one data warehouse plus the pipelines that fill it) carries its own
+# project.toml and lives in its own git repository - see `graetl new-project`.
+# One instance opens exactly one project.
+
 [server]
 host = "127.0.0.1"
 port = 8777
 
-[paths]
-# Everything portable lives here: code, config, state, logs, etl.db
-pipelines = "pipelines"
+[project]
+# The project this instance opens when none is given on the command line.
+# Overridden by `graetl serve <project>` and by GRAETL_PROJECT.
+# path = "../warehouse-sicdb"
 
 [runtime]
+# Defaults. A project's own [runtime] block overrides anything here, because
+# parallelism and batch sizes are properties of the warehouse, not the machine.
 log_retention_runs = 50     # JSONL console logs kept per pipeline
 console_buffer_lines = 2000 # lines replayed to a newly opened console
 stop_grace_seconds = 20     # graceful stop window before the process is killed
@@ -27,13 +36,7 @@ cache_size = 4096           # entries kept per cached pipeline function
 monaco_url = "https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs"
 
 [graphs]
-# Defaults for node graphs. Both can also be set per pipeline in pipeline.toml.
-# Reflected nodes (py:math.floor and friends) are treated as pure - no execution
-# pins, folded into the expression that uses them - when their module is listed
-# here. Leave it unset for the built-in list of side-effect-free stdlib modules.
+# Defaults for node graphs. Both can also be set per project in project.toml,
+# or per pipeline in pipeline.toml.
 # pure_modules = ["math", "statistics", "json", "re", "datetime"]
-#
-# When set, only these dotted roots may be reflected at all. Unset means any
-# importable callable is fair game, which is the same power pipeline.py already
-# has.
 # reflect_allow = ["math", "statistics"]

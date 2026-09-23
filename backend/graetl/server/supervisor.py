@@ -232,6 +232,8 @@ class Supervisor:
             "run",
             "--root",
             str(self.settings.root),
+            "--project",
+            str(self.settings.require_project().root),
             "--pipeline",
             pipeline_id,
             "--run-id",

@@ -1,6 +1,9 @@
-"""Per-pipeline entity state (``pipelines/<id>/state.db``).
+"""Per-entity state: what makes a pipeline resumable.
 
-This is the database that makes a pipeline *resumable*. Two tables:
+These tables live in the **project's target database** alongside the warehouse
+tables the pipelines write - that co-location is the whole point, see below.
+One project holds many pipelines, so every row carries a ``pipeline`` column
+and a :class:`StateStore` is scoped to one of them.
 
 ``entities``
     One row per business entity the pipeline knows about (an ICU admission, a
@@ -25,21 +28,24 @@ This is the database that makes a pipeline *resumable*. Two tables:
 
 Transactional safety
 --------------------
-Module code writes its data through the very same SQLite connection
-(``ctx.db``). ``entity_transaction()`` opens one transaction that covers *both*
-the module's data writes and the state row update, so a crash can never leave
-"state says done, data was never written". Writes to systems outside this
-connection are at-least-once: the state row is only flipped to ``done`` after
-the module returns, so an interrupted entity is retried on resume.
+Module code writes its data through the very same connection (``ctx.db``), into
+the very same database. ``entity_transaction()`` opens one transaction that
+covers *both* the module's data writes and the state row update, so a crash can
+never leave "state says done, data was never written". This holds identically on
+SQLite and PostgreSQL, which is why GraETL keeps its bookkeeping in the target
+rather than in a database of its own. Writes to systems outside this connection
+are at-least-once: the state row is only flipped to ``done`` after the module
+returns, so an interrupted entity is retried on resume.
 
 Concurrency
 -----------
-Each module worker owns its own ``StateStore`` (its own SQLite connection) and
-the database runs in WAL mode. Two transaction modes:
+Each module worker owns its own :class:`StateStore` (its own connection). Two
+transaction modes:
 
 ``immediate``
     Takes the write lock up front. Used when modules run one at a time - no
-    contention, no retries, the simplest possible behaviour.
+    contention, no retries, the simplest possible behaviour. On PostgreSQL there
+    is nothing to take up front, so this is an ordinary ``BEGIN``.
 ``deferred``
     Takes the write lock at the first write, so parallel modules only serialise
     around their writes rather than around their whole body. A write conflict
@@ -51,26 +57,34 @@ the database runs in WAL mode. Two transaction modes:
 from __future__ import annotations
 
 import os
-import random
 import socket
 import sqlite3
 import threading
-import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
 
-from graetl.store.sqlite import apply_migrations, connect
+from graetl.store.db import Database, LockConflict, Target, apply_migrations, connect
 from graetl.utils import dumps, loads, now_iso, to_iso
 
-class LockConflict(RuntimeError):
-    """Another writer held the database; the caller should retry the entity."""
+__all__ = [
+    "EntityModuleState",
+    "LockConflict",
+    "StateStore",
+    "WorkItem",
+    "is_lock_error",
+    "worker_id",
+]
 
 
 def is_lock_error(exc: BaseException) -> bool:
-    """True for SQLite's "someone else is writing" errors, which are retryable."""
+    """True for SQLite's "someone else is writing" errors, which are retryable.
+
+    Kept for callers that have no store at hand; a :class:`StateStore` asks its
+    own dialect, which also knows PostgreSQL's serialization failures.
+    """
     if not isinstance(exc, sqlite3.OperationalError):
         return False
     text = str(exc).lower()
@@ -79,9 +93,7 @@ def is_lock_error(exc: BaseException) -> bool:
 
 def worker_id() -> str:
     """Identifies one worker uniquely across threads, processes and machines."""
-    return (
-        f"{socket.gethostname()}:{os.getpid()}:{threading.get_ident()}:{uuid.uuid4().hex[:8]}"
-    )
+    return f"{socket.gethostname()}:{os.getpid()}:{threading.get_ident()}:{uuid.uuid4().hex[:8]}"
 
 
 STATUS_PENDING = "pending"
@@ -92,18 +104,23 @@ STATUS_SKIPPED = "skipped"
 
 MIGRATIONS: list[str] = [
     """
-    CREATE TABLE IF NOT EXISTS entities (
-        entity_id          TEXT PRIMARY KEY,
+    CREATE TABLE IF NOT EXISTS [[entities]] (
+        pipeline           TEXT NOT NULL,
+        entity_id          TEXT NOT NULL,
         label              TEXT,
         source_updated_at  TEXT,
         payload_json       TEXT NOT NULL DEFAULT '{}',
         discovered_at      TEXT NOT NULL,
         last_seen_at       TEXT NOT NULL,
-        deleted_at         TEXT
+        deleted_at         TEXT,
+        PRIMARY KEY (pipeline, entity_id)
     );
-    CREATE INDEX IF NOT EXISTS idx_entities_seen ON entities(last_seen_at);
+    CREATE INDEX IF NOT EXISTS idx_entities_seen ON [[entities]](pipeline, last_seen_at);
+    CREATE INDEX IF NOT EXISTS idx_entities_revision ON [[entities]](pipeline, source_updated_at);
+    CREATE INDEX IF NOT EXISTS idx_entities_discovered ON [[entities]](pipeline, discovered_at);
 
-    CREATE TABLE IF NOT EXISTS entity_module_state (
+    CREATE TABLE IF NOT EXISTS [[entity_module_state]] (
+        pipeline                     TEXT NOT NULL,
         entity_id                    TEXT NOT NULL,
         module                       TEXT NOT NULL,
         module_version               INTEGER NOT NULL DEFAULT 1,
@@ -112,36 +129,34 @@ MIGRATIONS: list[str] = [
         processed_source_updated_at  TEXT,
         processed_at                 TEXT,
         attempts                     INTEGER NOT NULL DEFAULT 0,
-        run_id                       INTEGER,
-        duration_ms                  INTEGER,
+        run_id                       BIGINT,
+        duration_ms                  BIGINT,
         error                        TEXT,
         result_json                  TEXT,
         updated_at                   TEXT NOT NULL,
-        PRIMARY KEY (entity_id, module)
+        PRIMARY KEY (pipeline, entity_id, module)
     );
-    CREATE INDEX IF NOT EXISTS idx_ems_module_status ON entity_module_state(module, status);
-    CREATE INDEX IF NOT EXISTS idx_ems_run ON entity_module_state(run_id);
+    CREATE INDEX IF NOT EXISTS idx_ems_module_status
+        ON [[entity_module_state]](pipeline, module, status);
+    CREATE INDEX IF NOT EXISTS idx_ems_run ON [[entity_module_state]](run_id);
+    CREATE INDEX IF NOT EXISTS idx_ems_entity ON [[entity_module_state]](pipeline, entity_id);
 
-    CREATE TABLE IF NOT EXISTS pipeline_meta (
-        key        TEXT PRIMARY KEY,
+    CREATE TABLE IF NOT EXISTS [[pipeline_meta]] (
+        pipeline   TEXT NOT NULL,
+        key        TEXT NOT NULL,
         value_json TEXT NOT NULL,
-        updated_at TEXT NOT NULL
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (pipeline, key)
     );
-    """,
-    # 2 - indexes that matter once an entity table gets big
-    """
-    CREATE INDEX IF NOT EXISTS idx_entities_revision ON entities(source_updated_at);
-    CREATE INDEX IF NOT EXISTS idx_entities_discovered ON entities(discovered_at);
-    CREATE INDEX IF NOT EXISTS idx_ems_entity ON entity_module_state(entity_id);
-    """,
-    # 3 - one worker per module, across threads and processes
-    """
-    CREATE TABLE IF NOT EXISTS module_locks (
-        module       TEXT PRIMARY KEY,
+
+    CREATE TABLE IF NOT EXISTS [[module_locks]] (
+        pipeline     TEXT NOT NULL,
+        module       TEXT NOT NULL,
         owner        TEXT NOT NULL,
-        run_id       INTEGER,
+        run_id       BIGINT,
         acquired_at  TEXT NOT NULL,
-        heartbeat_at TEXT NOT NULL
+        heartbeat_at TEXT NOT NULL,
+        PRIMARY KEY (pipeline, module)
     );
     """,
 ]
@@ -177,25 +192,34 @@ class WorkItem:
 class StateStore:
     """Entity state for one pipeline. Also the connection module code writes through."""
 
-    def __init__(self, path: str | Path) -> None:
-        self.path = Path(path)
+    def __init__(self, db: Database | str | Path | Target, pipeline: str = "default") -> None:
+        self.db = _as_database(db)
+        self.pipeline = pipeline
         #: Identity of this connection, used for module locks.
         self.worker = worker_id()
-        self.conn: sqlite3.Connection = connect(self.path)
-        self.conn.isolation_level = None  # explicit transaction control
-        apply_migrations(self.conn, MIGRATIONS)
+        apply_migrations(self.db, MIGRATIONS, "state")
+
+    @property
+    def conn(self) -> Database:
+        """What ``ctx.db`` hands to module code."""
+        return self.db
+
+    @property
+    def path(self) -> Path | None:
+        target = self.db.target
+        return target.path if target and not target.is_postgres else None
 
     def close(self) -> None:
-        try:
-            self.conn.close()
-        except Exception:  # pragma: no cover
-            pass
+        self.db.close()
 
     def __enter__(self) -> StateStore:
         return self
 
     def __exit__(self, *exc: object) -> None:
         self.close()
+
+    def _is_lock_error(self, exc: BaseException) -> bool:
+        return self.db.dialect.is_lock_error(exc)
 
     # ---------------------------------------------------------------- entities
 
@@ -210,23 +234,31 @@ class StateStore:
         """Insert or refresh an entity. Returns True when it is new or changed."""
         ts = now_iso()
         rev = to_iso(source_updated_at)
-        cur = self.conn.execute(
-            "SELECT source_updated_at FROM entities WHERE entity_id = ?", (entity_id,)
-        ).fetchone()
+        cur = self.db.fetchone(
+            "SELECT source_updated_at FROM [[entities]] WHERE pipeline = ? AND entity_id = ?",
+            (self.pipeline, entity_id),
+        )
         if cur is None:
-            self.conn.execute(
-                "INSERT INTO entities (entity_id, label, source_updated_at, payload_json, "
-                "discovered_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (entity_id, label, rev, dumps(payload or {}), ts, ts),
+            self.db.execute(
+                "INSERT INTO [[entities]] (pipeline, entity_id, label, source_updated_at, "
+                "payload_json, discovered_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (self.pipeline, entity_id, label, rev, dumps(payload or {}), ts, ts),
             )
             return True
         changed = rev is not None and rev != cur["source_updated_at"]
-        self.conn.execute(
-            "UPDATE entities SET label = COALESCE(?, label), "
+        self.db.execute(
+            "UPDATE [[entities]] SET label = COALESCE(?, label), "
             "source_updated_at = COALESCE(?, source_updated_at), "
             "payload_json = COALESCE(?, payload_json), last_seen_at = ?, deleted_at = NULL "
-            "WHERE entity_id = ?",
-            (label, rev, dumps(payload) if payload is not None else None, ts, entity_id),
+            "WHERE pipeline = ? AND entity_id = ?",
+            (
+                label,
+                rev,
+                dumps(payload) if payload is not None else None,
+                ts,
+                self.pipeline,
+                entity_id,
+            ),
         )
         return changed
 
@@ -236,9 +268,10 @@ class StateStore:
         self.begin("immediate")
         try:
             for entity_id, label, rev, payload in entities:
-                existed = self.conn.execute(
-                    "SELECT 1 FROM entities WHERE entity_id = ?", (entity_id,)
-                ).fetchone()
+                existed = self.db.fetchone(
+                    "SELECT 1 AS hit FROM [[entities]] WHERE pipeline = ? AND entity_id = ?",
+                    (self.pipeline, entity_id),
+                )
                 changed = self.upsert_entity(
                     entity_id, label=label, source_updated_at=rev, payload=payload
                 )
@@ -254,29 +287,32 @@ class StateStore:
         return stats
 
     def soft_delete_unseen(self, cutoff_iso: str) -> int:
-        cur = self.conn.execute(
-            "UPDATE entities SET deleted_at = ? WHERE deleted_at IS NULL AND last_seen_at < ?",
-            (now_iso(), cutoff_iso),
+        cur = self.db.execute(
+            "UPDATE [[entities]] SET deleted_at = ? "
+            "WHERE pipeline = ? AND deleted_at IS NULL AND last_seen_at < ?",
+            (now_iso(), self.pipeline, cutoff_iso),
         )
         return cur.rowcount or 0
 
     def count_entities(self, include_deleted: bool = False) -> int:
-        sql = "SELECT COUNT(*) AS n FROM entities"
+        sql = "SELECT COUNT(*) AS n FROM [[entities]] WHERE pipeline = ?"
         if not include_deleted:
-            sql += " WHERE deleted_at IS NULL"
-        return int(self.conn.execute(sql).fetchone()["n"])
+            sql += " AND deleted_at IS NULL"
+        return int(self.db.fetchone(sql, (self.pipeline,))["n"])
 
-    @staticmethod
     def _entity_filter(
-        search: str | None, status: str | None, module: str | None
+        self, search: str | None, status: str | None, module: str | None
     ) -> tuple[list[str], list[Any]]:
-        where = ["e.deleted_at IS NULL"]
-        args: list[Any] = []
+        where = ["e.pipeline = ?", "e.deleted_at IS NULL"]
+        args: list[Any] = [self.pipeline]
         if search:
-            where.append("(e.entity_id LIKE ? OR IFNULL(e.label,'') LIKE ?)")
+            where.append("(e.entity_id [[ilike]] ? OR COALESCE(e.label,'') [[ilike]] ?)")
             args.extend([f"%{search}%", f"%{search}%"])
         if status or module:
-            sub = "SELECT 1 FROM entity_module_state s WHERE s.entity_id = e.entity_id"
+            sub = (
+                "SELECT 1 FROM [[entity_module_state]] s "
+                "WHERE s.pipeline = e.pipeline AND s.entity_id = e.entity_id"
+            )
             sub_args: list[Any] = []
             if status:
                 sub += " AND s.status = ?"
@@ -297,8 +333,8 @@ class StateStore:
     ) -> int:
         """How many entities match the filters - what the UI pages through."""
         where, args = self._entity_filter(search, status, module)
-        sql = "SELECT COUNT(*) AS n FROM entities e WHERE " + " AND ".join(where)
-        return int(self.conn.execute(sql, args).fetchone()["n"])
+        sql = "SELECT COUNT(*) AS n FROM [[entities]] e WHERE " + " AND ".join(where)
+        return int(self.db.fetchone(sql, args)["n"])
 
     def list_entities(
         self,
@@ -318,17 +354,17 @@ class StateStore:
             "revision": "e.source_updated_at DESC, e.entity_id",
         }.get(order, "e.entity_id")
         sql = (
-            "SELECT e.* FROM entities e WHERE "
+            "SELECT e.* FROM [[entities]] e WHERE "
             + " AND ".join(where)
             + f" ORDER BY {order_sql} LIMIT ? OFFSET ?"
         )
-        args = [*args, limit, offset]
-        rows = self.conn.execute(sql, args).fetchall()
+        rows = self.db.fetchall(sql, [*args, limit, offset])
         out: list[dict[str, Any]] = []
         ids = [r["entity_id"] for r in rows]
         states = self.states_for(ids)
         for row in rows:
             d = dict(row)
+            d.pop("pipeline", None)
             d["payload"] = loads(d.pop("payload_json", None), {})
             d["modules"] = states.get(d["entity_id"], [])
             out.append(d)
@@ -338,34 +374,36 @@ class StateStore:
         if not entity_ids:
             return {}
         placeholders = ",".join("?" * len(entity_ids))
-        rows = self.conn.execute(
-            f"SELECT * FROM entity_module_state WHERE entity_id IN ({placeholders}) "
-            "ORDER BY module",
-            tuple(entity_ids),
-        ).fetchall()
+        rows = self.db.fetchall(
+            f"SELECT * FROM [[entity_module_state]] WHERE pipeline = ? "
+            f"AND entity_id IN ({placeholders}) ORDER BY module",
+            (self.pipeline, *entity_ids),
+        )
         out: dict[str, list[dict[str, Any]]] = {}
         for row in rows:
             d = dict(row)
+            d.pop("pipeline", None)
             d["result"] = loads(d.pop("result_json", None))
             out.setdefault(d["entity_id"], []).append(d)
         return out
 
     def get_entity(self, entity_id: str) -> dict[str, Any] | None:
-        row = self.conn.execute(
-            "SELECT * FROM entities WHERE entity_id = ?", (entity_id,)
-        ).fetchone()
+        row = self.db.fetchone(
+            "SELECT * FROM [[entities]] WHERE pipeline = ? AND entity_id = ?",
+            (self.pipeline, entity_id),
+        )
         if row is None:
             return None
         d = dict(row)
+        d.pop("pipeline", None)
         d["payload"] = loads(d.pop("payload_json", None), {})
         d["modules"] = self.states_for([entity_id]).get(entity_id, [])
         return d
 
-    # -------------------------------------------------------------- work queue
+    # ------------------------------------------------------------ work queue
 
     def _work_where(
         self,
-        module: str,
         version: int,
         *,
         mode: str,
@@ -377,8 +415,8 @@ class StateStore:
         entity_ids: Sequence[str] | None,
     ) -> tuple[str, list[Any]]:
         """The WHERE clause shared by select_work() and count_work()."""
-        args: list[Any] = [module]
-        where = ["e.deleted_at IS NULL"]
+        args: list[Any] = [self.pipeline]
+        where = ["e.pipeline = ?", "e.deleted_at IS NULL"]
 
         if entity_ids:
             where.append(f"e.entity_id IN ({','.join('?' * len(entity_ids))})")
@@ -409,20 +447,20 @@ class StateStore:
             if cascade and upstream:
                 placeholders = ",".join("?" * len(upstream))
                 clause += (
-                    " OR EXISTS (SELECT 1 FROM entity_module_state u"
-                    f"            WHERE u.entity_id = e.entity_id AND u.module IN ({placeholders})"
+                    " OR EXISTS (SELECT 1 FROM [[entity_module_state]] u"
+                    "            WHERE u.pipeline = e.pipeline AND u.entity_id = e.entity_id"
+                    f"              AND u.module IN ({placeholders})"
                     "              AND u.processed_at IS NOT NULL"
                     "              AND (s.processed_at IS NULL OR u.processed_at > s.processed_at))"
                 )
                 args.extend(upstream)
             where.append(clause + ")")
 
-        gates = (
-            [*requires, *((name, None) for name in depends_on)] if apply_requirements else []
-        )
+        gates = [*requires, *((name, None) for name in depends_on)] if apply_requirements else []
         for dep_name, dep_version in gates:
             clause = (
-                "EXISTS (SELECT 1 FROM entity_module_state d WHERE d.entity_id = e.entity_id "
+                "EXISTS (SELECT 1 FROM [[entity_module_state]] d "
+                "WHERE d.pipeline = e.pipeline AND d.entity_id = e.entity_id "
                 "AND d.module = ? AND d.status IN ('done', 'skipped')"
             )
             args.append(dep_name)
@@ -437,6 +475,12 @@ class StateStore:
             where.append(clause + ")")
 
         return " AND ".join(where), args
+
+    #: The join that hangs one module's state row off each entity.
+    _JOIN = (
+        "FROM [[entities]] e LEFT JOIN [[entity_module_state]] s "
+        "ON s.pipeline = e.pipeline AND s.entity_id = e.entity_id AND s.module = ?"
+    )
 
     def select_work(
         self,
@@ -473,8 +517,7 @@ class StateStore:
         ``order="random"`` picks an arbitrary sample, which is what a profile
         run over N entities uses.
         """
-        where, args = self._work_where(
-            module,
+        where, where_args = self._work_where(
             version,
             mode=mode,
             requires=requires,
@@ -486,16 +529,17 @@ class StateStore:
         )
         sql = (
             "SELECT e.entity_id, e.label, e.source_updated_at, e.payload_json, "
-            "IFNULL(s.attempts, 0) AS attempts, s.status AS previous_status "
-            "FROM entities e LEFT JOIN entity_module_state s "
-            "ON s.entity_id = e.entity_id AND s.module = ? "
-            "WHERE " + where
-            + (" ORDER BY RANDOM()" if order == "random" else " ORDER BY e.entity_id")
+            "COALESCE(s.attempts, 0) AS attempts, s.status AS previous_status "
+            + self._JOIN
+            + " WHERE "
+            + where
+            + (" ORDER BY random()" if order == "random" else " ORDER BY e.entity_id")
         )
+        args: list[Any] = [module, *where_args]
         if limit:
             sql += " LIMIT ?"
             args.append(limit)
-        rows = self.conn.execute(sql, args).fetchall()
+        rows = self.db.fetchall(sql, args)
         return [
             WorkItem(
                 entity_id=r["entity_id"],
@@ -521,8 +565,7 @@ class StateStore:
         entity_ids: Sequence[str] | None = None,
     ) -> int:
         """How much work a module has, without materialising it (100k-entity safe)."""
-        where, args = self._work_where(
-            module,
+        where, where_args = self._work_where(
             version,
             mode=mode,
             requires=requires,
@@ -532,31 +575,28 @@ class StateStore:
             after=None,
             entity_ids=entity_ids,
         )
-        sql = (
-            "SELECT COUNT(*) AS n FROM entities e LEFT JOIN entity_module_state s "
-            "ON s.entity_id = e.entity_id AND s.module = ? WHERE " + where
-        )
-        return int(self.conn.execute(sql, args).fetchone()["n"])
+        sql = "SELECT COUNT(*) AS n " + self._JOIN + " WHERE " + where
+        return int(self.db.fetchone(sql, [module, *where_args])["n"])
 
-    # ----------------------------------------------------------- state changes
+    # --------------------------------------------------------- state changes
 
     def mark_running(self, entity_id: str, module: str, version: int, run_id: int | None) -> None:
         ts = now_iso()
         self.begin("immediate")
-        self.conn.execute(
+        self.db.execute(
             """
-            INSERT INTO entity_module_state
-                (entity_id, module, module_version, status, attempts, run_id, updated_at)
-            VALUES (?, ?, ?, 'running', 1, ?, ?)
-            ON CONFLICT(entity_id, module) DO UPDATE SET
+            INSERT INTO [[entity_module_state]]
+                (pipeline, entity_id, module, module_version, status, attempts, run_id, updated_at)
+            VALUES (?, ?, ?, ?, 'running', 1, ?, ?)
+            ON CONFLICT(pipeline, entity_id, module) DO UPDATE SET
                 status = 'running',
                 module_version = excluded.module_version,
-                attempts = entity_module_state.attempts + 1,
+                attempts = [[entity_module_state]].attempts + 1,
                 run_id = excluded.run_id,
                 error = NULL,
                 updated_at = excluded.updated_at
             """,
-            (entity_id, module, version, run_id, ts),
+            (self.pipeline, entity_id, module, version, run_id, ts),
         )
         self.commit()
 
@@ -575,21 +615,22 @@ class StateStore:
     ) -> None:
         ts = now_iso()
         processed_rev = source_updated_at if status in (STATUS_DONE, STATUS_SKIPPED) else None
-        self.conn.execute(
+        self.db.execute(
             """
-            INSERT INTO entity_module_state
-                (entity_id, module, module_version, status, source_updated_at,
+            INSERT INTO [[entity_module_state]]
+                (pipeline, entity_id, module, module_version, status, source_updated_at,
                  processed_source_updated_at, processed_at, attempts, run_id,
                  duration_ms, error, result_json, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
-            ON CONFLICT(entity_id, module) DO UPDATE SET
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
+            ON CONFLICT(pipeline, entity_id, module) DO UPDATE SET
                 module_version = excluded.module_version,
                 status = excluded.status,
                 source_updated_at = excluded.source_updated_at,
                 processed_source_updated_at = COALESCE(
                     excluded.processed_source_updated_at,
-                    entity_module_state.processed_source_updated_at),
-                processed_at = COALESCE(excluded.processed_at, entity_module_state.processed_at),
+                    [[entity_module_state]].processed_source_updated_at),
+                processed_at = COALESCE(
+                    excluded.processed_at, [[entity_module_state]].processed_at),
                 run_id = excluded.run_id,
                 duration_ms = excluded.duration_ms,
                 error = excluded.error,
@@ -597,6 +638,7 @@ class StateStore:
                 updated_at = excluded.updated_at
             """,
             (
+                self.pipeline,
                 entity_id,
                 module,
                 version,
@@ -625,7 +667,7 @@ class StateStore:
     ) -> Iterator[dict[str, Any]]:
         """Run a module for one entity inside a single transaction.
 
-        Module data writes made through ``self.conn`` and the final state row
+        Module data writes made through ``ctx.db`` and the final state row
         update commit together, or not at all.
 
         ``mode="deferred"`` (used when modules run in parallel) takes the write
@@ -651,30 +693,11 @@ class StateStore:
             self.commit()
         except BaseException as exc:  # noqa: BLE001 - re-raised below
             self.rollback()
-            if is_lock_error(exc):
+            if self._is_lock_error(exc):
                 # Pure contention: nothing happened, nothing is recorded, retry.
                 raise LockConflict(str(exc)) from exc
-            # Interruptions (operator stop / run abort) must not poison the entity:
-            # it stays pending so the next run picks it up again.
-            pending = bool(getattr(exc, "graetl_pending", False)) or isinstance(
-                exc, KeyboardInterrupt
-            )
-            try:
-                self.begin("immediate")
-                self._write_final(
-                    entity_id,
-                    module,
-                    version,
-                    status=STATUS_PENDING if pending else STATUS_FAILED,
-                    run_id=run_id,
-                    source_updated_at=source_updated_at,
-                    duration_ms=outcome.get("duration_ms"),
-                    error=None if pending else f"{type(exc).__name__}: {exc}",
-                    result=None,
-                )
-                self.commit()
-            except sqlite3.OperationalError:  # pragma: no cover - could not record it
-                self.rollback()
+            self._record_failure([_Item(entity_id, source_updated_at)], module, version, exc,
+                                 run_id=run_id, duration_ms=outcome.get("duration_ms"))
             raise
 
     @contextmanager
@@ -714,44 +737,60 @@ class StateStore:
             self.commit()
         except BaseException as exc:  # noqa: BLE001 - re-raised below
             self.rollback()
-            if is_lock_error(exc):
+            if self._is_lock_error(exc):
                 raise LockConflict(str(exc)) from exc
-            pending = bool(getattr(exc, "graetl_pending", False)) or isinstance(
-                exc, KeyboardInterrupt
-            )
-            try:
-                self.begin("immediate")
-                for item in items:
-                    self._write_final(
-                        item.entity_id,
-                        module,
-                        version,
-                        status=STATUS_PENDING if pending else STATUS_FAILED,
-                        run_id=run_id,
-                        source_updated_at=item.source_updated_at,
-                        duration_ms=outcome.get("duration_ms"),
-                        error=None if pending else f"{type(exc).__name__}: {exc}",
-                        result=None,
-                    )
-                self.commit()
-            except sqlite3.OperationalError:  # pragma: no cover - could not record it
-                self.rollback()
+            self._record_failure(items, module, version, exc, run_id=run_id,
+                                 duration_ms=outcome.get("duration_ms"))
             raise
+
+    def _record_failure(
+        self,
+        items: Sequence[Any],
+        module: str,
+        version: int,
+        exc: BaseException,
+        *,
+        run_id: int | None,
+        duration_ms: int | None,
+    ) -> None:
+        """Write the outcome of a failed entity or batch, in its own transaction.
+
+        Interruptions (operator stop / run abort) must not poison the work: it
+        stays ``pending`` so the next run picks it up again.
+        """
+        pending = bool(getattr(exc, "graetl_pending", False)) or isinstance(exc, KeyboardInterrupt)
+        try:
+            self.begin("immediate")
+            for item in items:
+                self._write_final(
+                    item.entity_id,
+                    module,
+                    version,
+                    status=STATUS_PENDING if pending else STATUS_FAILED,
+                    run_id=run_id,
+                    source_updated_at=item.source_updated_at,
+                    duration_ms=duration_ms,
+                    error=None if pending else f"{type(exc).__name__}: {exc}",
+                    result=None,
+                )
+            self.commit()
+        except Exception:  # pragma: no cover - could not record it
+            self.rollback()
 
     def reset_stale_running(self, run_id: int | None = None) -> int:
         """Interrupted work (status ``running``) becomes ``pending`` again."""
         self.begin("immediate")
         if run_id is None:
-            cur = self.conn.execute(
-                "UPDATE entity_module_state SET status = 'pending', updated_at = ? "
-                "WHERE status = 'running'",
-                (now_iso(),),
+            cur = self.db.execute(
+                "UPDATE [[entity_module_state]] SET status = 'pending', updated_at = ? "
+                "WHERE pipeline = ? AND status = 'running'",
+                (now_iso(), self.pipeline),
             )
         else:
-            cur = self.conn.execute(
-                "UPDATE entity_module_state SET status = 'pending', updated_at = ? "
-                "WHERE status = 'running' AND run_id = ?",
-                (now_iso(), run_id),
+            cur = self.db.execute(
+                "UPDATE [[entity_module_state]] SET status = 'pending', updated_at = ? "
+                "WHERE pipeline = ? AND status = 'running' AND run_id = ?",
+                (now_iso(), self.pipeline, run_id),
             )
         n = cur.rowcount or 0
         self.commit()
@@ -759,7 +798,10 @@ class StateStore:
 
     def reset_module(self, module: str) -> int:
         self.begin("immediate")
-        cur = self.conn.execute("DELETE FROM entity_module_state WHERE module = ?", (module,))
+        cur = self.db.execute(
+            "DELETE FROM [[entity_module_state]] WHERE pipeline = ? AND module = ?",
+            (self.pipeline, module),
+        )
         n = cur.rowcount or 0
         self.commit()
         return n
@@ -774,21 +816,37 @@ class StateStore:
         keeping what is already there.
         """
         self.begin("immediate")
-        self.conn.execute("DELETE FROM module_locks WHERE module = ?", (old,))
-        cur = self.conn.execute(
-            "UPDATE OR IGNORE entity_module_state SET module = ? WHERE module = ?",
-            (new, old),
+        self.db.execute(
+            "DELETE FROM [[module_locks]] WHERE pipeline = ? AND module = ?",
+            (self.pipeline, old),
+        )
+        # SQLite's UPDATE OR IGNORE has no portable equivalent, so the rows that
+        # would collide are dropped first and the rest are moved.
+        self.db.execute(
+            "DELETE FROM [[entity_module_state]] WHERE pipeline = ? AND module = ? "
+            "AND entity_id IN (SELECT entity_id FROM [[entity_module_state]] "
+            "                  WHERE pipeline = ? AND module = ?)",
+            (self.pipeline, old, self.pipeline, new),
+        )
+        cur = self.db.execute(
+            "UPDATE [[entity_module_state]] SET module = ? WHERE pipeline = ? AND module = ?",
+            (new, self.pipeline, old),
         )
         moved = cur.rowcount or 0
-        self.conn.execute("DELETE FROM entity_module_state WHERE module = ?", (old,))
         self.commit()
         return moved
 
     def drop_module(self, module: str) -> int:
         """Forget a module entirely - used when its file is deleted."""
         self.begin("immediate")
-        self.conn.execute("DELETE FROM module_locks WHERE module = ?", (module,))
-        cur = self.conn.execute("DELETE FROM entity_module_state WHERE module = ?", (module,))
+        self.db.execute(
+            "DELETE FROM [[module_locks]] WHERE pipeline = ? AND module = ?",
+            (self.pipeline, module),
+        )
+        cur = self.db.execute(
+            "DELETE FROM [[entity_module_state]] WHERE pipeline = ? AND module = ?",
+            (self.pipeline, module),
+        )
         n = cur.rowcount or 0
         self.commit()
         return n
@@ -797,13 +855,15 @@ class StateStore:
         """Forget what a single entity has been through - the next run redoes it."""
         self.begin("immediate")
         if module:
-            cur = self.conn.execute(
-                "DELETE FROM entity_module_state WHERE entity_id = ? AND module = ?",
-                (entity_id, module),
+            cur = self.db.execute(
+                "DELETE FROM [[entity_module_state]] "
+                "WHERE pipeline = ? AND entity_id = ? AND module = ?",
+                (self.pipeline, entity_id, module),
             )
         else:
-            cur = self.conn.execute(
-                "DELETE FROM entity_module_state WHERE entity_id = ?", (entity_id,)
+            cur = self.db.execute(
+                "DELETE FROM [[entity_module_state]] WHERE pipeline = ? AND entity_id = ?",
+                (self.pipeline, entity_id),
             )
         n = cur.rowcount or 0
         self.commit()
@@ -811,17 +871,21 @@ class StateStore:
 
     def reset_all(self, *, drop_entities: bool = False) -> None:
         self.begin("immediate")
-        self.conn.execute("DELETE FROM entity_module_state")
+        self.db.execute(
+            "DELETE FROM [[entity_module_state]] WHERE pipeline = ?", (self.pipeline,)
+        )
         if drop_entities:
-            self.conn.execute("DELETE FROM entities")
+            self.db.execute("DELETE FROM [[entities]] WHERE pipeline = ?", (self.pipeline,))
         self.commit()
 
-    # -------------------------------------------------------------- summaries
+    # ------------------------------------------------------------- summaries
 
     def module_summary(self) -> list[dict[str, Any]]:
-        rows = self.conn.execute(
-            "SELECT module, status, COUNT(*) AS n FROM entity_module_state GROUP BY module, status"
-        ).fetchall()
+        rows = self.db.fetchall(
+            "SELECT module, status, COUNT(*) AS n FROM [[entity_module_state]] "
+            "WHERE pipeline = ? GROUP BY module, status",
+            (self.pipeline,),
+        )
         out: dict[str, dict[str, Any]] = {}
         for row in rows:
             entry = out.setdefault(row["module"], {"module": row["module"], "total": 0})
@@ -830,33 +894,37 @@ class StateStore:
         return sorted(out.values(), key=lambda e: e["module"])
 
     def status_counts(self) -> dict[str, int]:
-        rows = self.conn.execute(
-            "SELECT status, COUNT(*) AS n FROM entity_module_state GROUP BY status"
-        ).fetchall()
+        rows = self.db.fetchall(
+            "SELECT status, COUNT(*) AS n FROM [[entity_module_state]] "
+            "WHERE pipeline = ? GROUP BY status",
+            (self.pipeline,),
+        )
         return {r["status"]: int(r["n"]) for r in rows}
 
-    # ------------------------------------------------------------------- meta
+    # ------------------------------------------------------------------ meta
 
     def get_meta(self, key: str, default: Any = None) -> Any:
-        row = self.conn.execute(
-            "SELECT value_json FROM pipeline_meta WHERE key = ?", (key,)
-        ).fetchone()
+        row = self.db.fetchone(
+            "SELECT value_json FROM [[pipeline_meta]] WHERE pipeline = ? AND key = ?",
+            (self.pipeline, key),
+        )
         return loads(row["value_json"], default) if row else default
 
     def set_meta(self, key: str, value: Any) -> None:
-        in_tx = self.conn.in_transaction
+        in_tx = self.db.in_transaction
         if not in_tx:
             self.begin("immediate")
-        self.conn.execute(
-            "INSERT INTO pipeline_meta (key, value_json, updated_at) VALUES (?, ?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, "
+        self.db.execute(
+            "INSERT INTO [[pipeline_meta]] (pipeline, key, value_json, updated_at) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(pipeline, key) DO UPDATE SET value_json = excluded.value_json, "
             "updated_at = excluded.updated_at",
-            (key, dumps(value), now_iso()),
+            (self.pipeline, key, dumps(value), now_iso()),
         )
         if not in_tx:
             self.commit()
 
-    # ------------------------------------------------------------ module locks
+    # ---------------------------------------------------------- module locks
 
     def acquire_module_lock(
         self, module: str, *, run_id: int | None = None, owner: str | None = None
@@ -871,9 +939,11 @@ class StateStore:
         ts = now_iso()
         self.begin("immediate")
         try:
-            row = self.conn.execute(
-                "SELECT owner, heartbeat_at FROM module_locks WHERE module = ?", (module,)
-            ).fetchone()
+            row = self.db.fetchone(
+                "SELECT owner, heartbeat_at FROM [[module_locks]] "
+                "WHERE pipeline = ? AND module = ?",
+                (self.pipeline, module),
+            )
             if row is not None and row["owner"] != me:
                 age = _age_seconds(row["heartbeat_at"])
                 if age is not None and age < LOCK_STALE_SECONDS:
@@ -882,13 +952,14 @@ class StateStore:
                         f"module {module!r} is already being executed by {row['owner']} "
                         f"(last heartbeat {age:.0f}s ago)"
                     )
-            self.conn.execute(
-                "INSERT INTO module_locks (module, owner, run_id, acquired_at, heartbeat_at) "
-                "VALUES (?, ?, ?, ?, ?) "
-                "ON CONFLICT(module) DO UPDATE SET owner = excluded.owner, "
+            self.db.execute(
+                "INSERT INTO [[module_locks]] "
+                "(pipeline, module, owner, run_id, acquired_at, heartbeat_at) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(pipeline, module) DO UPDATE SET owner = excluded.owner, "
                 "run_id = excluded.run_id, acquired_at = excluded.acquired_at, "
                 "heartbeat_at = excluded.heartbeat_at",
-                (module, me, run_id, ts, ts),
+                (self.pipeline, module, me, run_id, ts, ts),
             )
             self.commit()
         except LockConflict:
@@ -901,26 +972,31 @@ class StateStore:
     def heartbeat_module_lock(self, module: str, owner: str) -> None:
         try:
             self.begin("immediate")
-            self.conn.execute(
-                "UPDATE module_locks SET heartbeat_at = ? WHERE module = ? AND owner = ?",
-                (now_iso(), module, owner),
+            self.db.execute(
+                "UPDATE [[module_locks]] SET heartbeat_at = ? "
+                "WHERE pipeline = ? AND module = ? AND owner = ?",
+                (now_iso(), self.pipeline, module, owner),
             )
             self.commit()
-        except sqlite3.OperationalError:  # pragma: no cover - a missed beat is harmless
+        except Exception:  # pragma: no cover - a missed beat is harmless
             self.rollback()
 
     def release_module_lock(self, module: str, owner: str) -> None:
         try:
             self.begin("immediate")
-            self.conn.execute(
-                "DELETE FROM module_locks WHERE module = ? AND owner = ?", (module, owner)
+            self.db.execute(
+                "DELETE FROM [[module_locks]] WHERE pipeline = ? AND module = ? AND owner = ?",
+                (self.pipeline, module, owner),
             )
             self.commit()
-        except sqlite3.OperationalError:  # pragma: no cover
+        except Exception:  # pragma: no cover
             self.rollback()
 
     def list_module_locks(self) -> list[dict[str, Any]]:
-        return [dict(r) for r in self.conn.execute("SELECT * FROM module_locks").fetchall()]
+        rows = self.db.fetchall(
+            "SELECT * FROM [[module_locks]] WHERE pipeline = ?", (self.pipeline,)
+        )
+        return [dict(r) for r in rows]
 
     @contextmanager
     def module_lock(self, module: str, *, run_id: int | None = None) -> Iterator[str]:
@@ -930,35 +1006,32 @@ class StateStore:
         finally:
             self.release_module_lock(module, owner)
 
-    # ------------------------------------------------------ transaction control
+    # ---------------------------------------------------- transaction control
 
     def begin(self, mode: str = "immediate") -> None:
-        """Open a transaction, waiting out other writers before giving up."""
-        if self.conn.in_transaction:
-            return
-        statement = "BEGIN IMMEDIATE" if mode == "immediate" else "BEGIN"
-        last: Exception | None = None
-        for attempt in range(6):
-            try:
-                self.conn.execute(statement)
-                return
-            except sqlite3.OperationalError as exc:  # pragma: no cover - timing dependent
-                if not is_lock_error(exc):
-                    raise
-                last = exc
-                time.sleep(min(0.05 * (2**attempt), 1.0) * (0.5 + random.random()))
-        raise LockConflict(f"could not start a transaction: {last}")
+        self.db.begin(mode)
 
     def commit(self) -> None:
-        if self.conn.in_transaction:
-            self.conn.commit()
+        self.db.commit()
 
     def rollback(self) -> None:
-        if self.conn.in_transaction:
-            try:
-                self.conn.rollback()
-            except sqlite3.OperationalError:  # pragma: no cover
-                pass
+        self.db.rollback()
+
+
+@dataclass(slots=True)
+class _Item:
+    """Adapter so a single entity can go through the same failure path as a batch."""
+
+    entity_id: str
+    source_updated_at: str | None
+
+
+def _as_database(db: Database | str | Path | Target) -> Database:
+    if isinstance(db, Database):
+        return db
+    if isinstance(db, Target):
+        return connect(db)
+    return connect(Target(system="sqlite", path=Path(db)))
 
 
 def _age_seconds(iso: str | None) -> float | None:
@@ -967,7 +1040,9 @@ def _age_seconds(iso: str | None) -> float | None:
     from datetime import datetime, timezone
 
     try:
-        then = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        then = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
     except ValueError:  # pragma: no cover
         return None
+    if then.tzinfo is None:
+        then = then.replace(tzinfo=timezone.utc)
     return (datetime.now(timezone.utc) - then).total_seconds()

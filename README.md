@@ -2,9 +2,14 @@
 
 **Gra**phical **ETL** — a tool for orchestrating, running and developing ETL pipelines.
 
-Python backend, browser console, SQLite inside. Every run happens in its own OS
-process, so pipeline code can never take the server down, and a run can be
-paused, resumed and stopped safely at any time.
+Python backend, browser console, SQLite or PostgreSQL underneath. Every run
+happens in its own OS process, so pipeline code can never take the server down,
+and a run can be paused, resumed and stopped safely at any time.
+
+GraETL manages **projects**. A project is one data warehouse - a target
+database, a file root, and the pipelines that fill it - and it lives in its own
+folder and its own git repository. The tool is installed; a project is *opened*.
+One running instance opens exactly one project.
 
 ---
 
@@ -14,11 +19,19 @@ paused, resumed and stopped safely at any time.
 # 1. install (uv recommended)
 uv sync                      # or: python -m venv .venv && pip install -e ".[data,dev]"
 
-# 2. start the server + UI
-uv run graetl serve          # http://127.0.0.1:8777
+# 2. create a warehouse - this is your project, and its own git repository
+uv run graetl new-project ../warehouse-demo
+
+# 3. open it
+uv run graetl serve ../warehouse-demo      # http://127.0.0.1:8777
 ```
 
-Open <http://127.0.0.1:8777>. Three demo pipelines ship with the project:
+Started without a project (`graetl serve`), the console shows a picker instead:
+recent projects, a folder browser, and a form to create one. Nothing else in the
+UI works until a warehouse is open, because nothing else means anything without
+one.
+
+Demo pipelines you can copy into a project:
 
 | Pipeline | Kind | What it shows |
 | --- | --- | --- |
@@ -29,7 +42,12 @@ Open <http://127.0.0.1:8777>. Three demo pipelines ship with the project:
 ### Command line
 
 ```bash
-graetl serve                     # server + UI
+graetl new-project ../warehouse  # create a warehouse (and git init it)
+graetl new-project ../wh --target postgres --dsn postgresql://etl@host/wh
+graetl serve ../warehouse        # server + UI, opening that project
+graetl projects                  # recently opened projects
+graetl doctor                    # instance, project, target and driver health
+graetl import-legacy ./old/pipelines   # bring a pre-project install into this one
 graetl list                      # discovered pipelines
 graetl new my_flow --template stateful
 graetl new-module my_flow load_vital_signals   # modules/load_vital_signals/load_vital_signals.module.py
@@ -43,15 +61,23 @@ graetl inspect icu_admissions    # pipeline definition as JSON
 
 ---
 
-## The `pipelines/` folder is the project
+## The project is the warehouse
 
-Everything portable lives in one folder. Copy it, back it up, put it in git —
-that is the whole installation state.
+A project folder is meant to **be a git repository**. Everything in it is either
+source - pipeline code, graphs, configuration - or runtime state that the
+generated `.gitignore` already excludes. Copy the folder, and you have copied
+the warehouse's definition.
 
 ```
-pipelines/
-├── etl.db                          # internal database: registry, runs, metrics, control
-└── icu_admissions/                 # one folder per pipeline
+warehouse-sicdb/
+├── project.toml                    # identity, target database, file root
+├── logo.png                        # shown in the console header
+├── .gitignore                      # written for you: *.db, files/, logs/, .env
+├── .env                            # git-ignored: secrets for ${VAR} in the DSN
+├── warehouse.db                    # the target, when it is sqlite (git-ignored)
+├── files/                          # target file path: DICOM, exports, attachments
+└── pipelines/
+    └── icu_admissions/             # one folder per pipeline
     ├── pipeline.py                 # the standardized entry file
     ├── pipeline.toml               # configuration (ctx.config / ctx.setting("a.b"))
     ├── shared.graphlib             # library of node-flow functions, pipeline wide
@@ -64,11 +90,92 @@ pipelines/
     │       ├── module.toml              # defaults for the whole folder
     │       ├── cleanup.graph            # node-flow module (a module too)
     │       └── helpers.graphlib         # library of node-flow functions
-    ├── state.db                    # entity state (stateful pipelines only)
-    ├── data/                       # whatever the pipeline reads and writes
-    ├── logs/run_000123.jsonl       # console output per run
-    └── profiles/                   # cProfile dumps from profiled runs
+        ├── data/                   # whatever the pipeline reads and writes
+        ├── logs/run_000123.jsonl   # console output per run
+        └── profiles/               # cProfile dumps from profiled runs
 ```
+
+### `project.toml`
+
+```toml
+schema = 1
+
+[project]
+name = "sicdb"
+title = "SICdb Warehouse"
+# logo = "logo.png"      # picked up automatically if it sits beside this file
+
+[target]
+system = "postgres"      # or "sqlite"
+dsn = "postgresql://etl:${PGPASSWORD}@db.internal:5432/warehouse"
+schema = "graetl"        # where GraETL's own tables go
+# system = "sqlite" uses:
+# path = "warehouse.db"
+
+[files]
+root = "files"           # absolute paths are allowed
+
+[runtime]                # overrides the instance-wide graetl.toml
+# parallel_modules = 4
+```
+
+A `${VAR}` in the DSN is expanded from the environment, then from a git-ignored
+`.env` beside `project.toml`, so **no password is ever committed**. An unset
+variable is left as-is, so the connection error names the placeholder.
+`GRAETL_TARGET_DSN` overrides the DSN outright.
+
+### Where things are written
+
+| What | Goes to |
+| --- | --- |
+| The tables a module writes (`ctx.db`) | the target database |
+| Entity state, module state, run history | the target database, in GraETL's namespace |
+| Files a module produces (`ctx.file(...)`) | the project's file root |
+| Run logs and profiles | the pipeline folder |
+
+**GraETL's own tables live in the target** - `graetl_*` on SQLite, schema
+`graetl` on PostgreSQL. That is deliberate: a module's data write and its state
+row then commit in **one transaction**, so "state says done, data was never
+written" is impossible on either backend. The price is that the console needs
+the warehouse reachable to show you anything, which it says plainly when it is
+not.
+
+### SQLite or PostgreSQL
+
+Module code does not change between them. SQL is written with `?` placeholders
+and translated per backend, so this runs on both:
+
+```python
+ctx.db.execute(
+    "INSERT INTO scores (entity_id, n) VALUES (?, ?) "
+    "ON CONFLICT(entity_id) DO UPDATE SET n = excluded.n",
+    (entity.id, score),
+)
+```
+
+PostgreSQL is reached through `psycopg` (v3) when installed, then `psycopg2`,
+and otherwise through a small pure-Python driver bundled with GraETL - so an
+air-gapped install works with no wheels to fetch. `graetl doctor` says which one
+is in use. The bundled driver does not support `COPY`, `LISTEN`/`NOTIFY`,
+server-side cursors or pooling; install `psycopg` if you need those.
+
+### Coming from a pre-project installation
+
+Older GraETL kept everything in one `pipelines/` folder, with each pipeline's
+data *inside* its `state.db`. To move that into a project:
+
+```bash
+graetl new-project ../warehouse-sicdb
+# copy the pipeline source (pipeline.py, *.graph, *.nodes.py, *.toml) into
+# ../warehouse-sicdb/pipelines/, then bring the databases across:
+graetl --project ../warehouse-sicdb import-legacy ./old/pipelines
+```
+
+`import-legacy` carries over entities, module state, pipeline meta, the registry
+and the run history - filling in the pipeline each row belongs to - and moves
+the warehouse tables out of every `state.db` into the target. Run ids are kept,
+so old run logs still line up. Nothing in the old folder is modified; add
+`--dry-run` to see what it would do first.
 
 **One file, one module.** Every `*.module.py` anywhere below the pipeline folder
 is loaded automatically and defines exactly one module, named after the file.

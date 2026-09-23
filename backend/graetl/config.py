@@ -1,9 +1,25 @@
-"""Project layout + settings.
+"""Instance settings and the project they open.
 
-The whole portable state of a GraETL installation lives in the ``pipelines``
-folder: the internal database (``pipelines/etl.db``) plus one folder per
-pipeline containing its code, configuration, data, logs and entity state.
-Copying that folder copies the installation.
+Two files, two lifetimes:
+
+``graetl.toml`` - **the instance**
+    Belongs to the installation: which address to serve on, where the code
+    editor comes from, which Python spawns runners, and default runtime knobs.
+    It follows the machine, not the data.
+
+``project.toml`` - **the project** (see :mod:`graetl.project`)
+    Belongs to the warehouse: its identity and logo, its target database, its
+    file root, its pipelines. It is committed to the project's own git
+    repository and moves between machines with the data.
+
+One instance opens exactly one project. :class:`Settings` is the two of them
+together, and is what the server, the CLI and the runner are handed. A project
+can be absent - that is the state the console's project picker exists for - so
+anything that needs one goes through :meth:`Settings.require_project`.
+
+Resolution order for *which* project: an explicit path, then
+``GRAETL_PROJECT``, then ``[project] path`` in ``graetl.toml``, then a project
+folder found by walking up from the working directory.
 """
 
 from __future__ import annotations
@@ -13,16 +29,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-try:  # Python 3.11+
-    import tomllib
-except ModuleNotFoundError:  # pragma: no cover
-    import tomli as tomllib  # type: ignore[no-redef]
+from graetl.project import (
+    PROJECT_FILENAME,
+    Project,
+    ProjectError,
+    find_project,
+    read_toml,
+)
+from graetl.store.db import Database, Target, connect
 
 CONFIG_FILENAME = "graetl.toml"
 PIPELINE_CONFIG_FILENAME = "pipeline.toml"
 PIPELINE_ENTRY_FILENAME = "pipeline.py"
-CORE_DB_FILENAME = "etl.db"
-STATE_DB_FILENAME = "state.db"
 
 # Modules: any file named "<name>.module.py" anywhere under the pipeline folder
 # is loaded automatically and defines exactly one module. Plain .py files next to
@@ -40,8 +58,6 @@ MODULE_CONFIG_FILENAME = "module.toml"  # folder-wide defaults
 # Folders that hold runtime state, never pipeline code.
 RUNTIME_DIRNAMES = frozenset({"data", "logs", "profiles", ".cache", "__pycache__"})
 
-# Visual node-flow assets (compiled and executed in a later version; for now they
-# are discovered and listed so the UI and the definition know about them).
 GRAPH_SUFFIX = ".graph"
 GRAPHLIB_SUFFIX = ".graphlib"
 
@@ -52,12 +68,16 @@ MONACO_VERSION = "0.52.2"
 MONACO_CDN = f"https://cdn.jsdelivr.net/npm/monaco-editor@{MONACO_VERSION}/min/vs"
 
 
-def _find_project_root(start: Path) -> Path:
+class NoProjectOpen(RuntimeError):
+    """An operation needed a project and this instance has none open."""
+
+
+def _find_instance_root(start: Path) -> Path:
     cur = start.resolve()
     for candidate in (cur, *cur.parents):
         if (candidate / CONFIG_FILENAME).exists():
             return candidate
-        if (candidate / "pipelines").is_dir() and (candidate / "pyproject.toml").exists():
+        if (candidate / "backend" / "graetl").is_dir() and (candidate / "pyproject.toml").exists():
             return candidate
     return cur
 
@@ -65,7 +85,7 @@ def _find_project_root(start: Path) -> Path:
 @dataclass(slots=True)
 class Settings:
     root: Path
-    pipelines_dir: Path
+    project: Project | None = None
     host: str = "127.0.0.1"
     port: int = 8777
     log_retention_runs: int = 50
@@ -87,15 +107,34 @@ class Settings:
     monaco_url: str = MONACO_CDN
     raw: dict[str, Any] = field(default_factory=dict)
 
+    # --------------------------------------------------------------- project
+
     @property
-    def core_db_path(self) -> Path:
-        return self.pipelines_dir / CORE_DB_FILENAME
+    def has_project(self) -> bool:
+        return self.project is not None
+
+    def require_project(self) -> Project:
+        if self.project is None:
+            raise NoProjectOpen(
+                "no GraETL project is open. Pass one to `graetl serve <project>`, "
+                f"set GRAETL_PROJECT, or run from inside a folder with a {PROJECT_FILENAME}."
+            )
+        return self.project
+
+    @property
+    def target(self) -> Target:
+        return self.require_project().target
+
+    @property
+    def pipelines_dir(self) -> Path:
+        return self.require_project().pipelines_dir
+
+    @property
+    def files_root(self) -> Path:
+        return self.require_project().files_root
 
     def pipeline_dir(self, pipeline_id: str) -> Path:
         return self.pipelines_dir / pipeline_id
-
-    def state_db_path(self, pipeline_id: str) -> Path:
-        return self.pipeline_dir(pipeline_id) / STATE_DB_FILENAME
 
     def logs_dir(self, pipeline_id: str) -> Path:
         return self.pipeline_dir(pipeline_id) / "logs"
@@ -107,32 +146,61 @@ class Settings:
         return self.logs_dir(pipeline_id) / f"run_{run_id:06d}.jsonl"
 
     def ensure_dirs(self) -> None:
-        self.pipelines_dir.mkdir(parents=True, exist_ok=True)
+        self.require_project().ensure_dirs()
+
+    # -------------------------------------------------------------- database
+
+    def open_database(self) -> Database:
+        """A fresh connection to the project's target. The caller closes it."""
+        return connect(self.target)
+
+    def core_store(self) -> Any:
+        from graetl.store.core import CoreStore
+
+        return CoreStore(self.open_database())
+
+    def state_store(self, pipeline_id: str) -> Any:
+        from graetl.store.state import StateStore
+
+        return StateStore(self.open_database(), pipeline_id)
 
 
-def load_settings(root: str | os.PathLike[str] | None = None) -> Settings:
-    base = Path(root) if root else _find_project_root(Path(os.environ.get("GRAETL_ROOT", ".")))
+def load_settings(
+    root: str | os.PathLike[str] | None = None,
+    *,
+    project: str | os.PathLike[str] | None = None,
+    require_project: bool = False,
+) -> Settings:
+    base = Path(root) if root else _find_instance_root(Path(os.environ.get("GRAETL_ROOT", ".")))
     base = base.resolve()
-    data: dict[str, Any] = {}
-    cfg_file = base / CONFIG_FILENAME
-    if cfg_file.exists():
-        with cfg_file.open("rb") as fh:
-            data = tomllib.load(fh)
+    data = read_toml(base / CONFIG_FILENAME)
 
-    server = data.get("server", {}) if isinstance(data.get("server"), dict) else {}
-    runtime = data.get("runtime", {}) if isinstance(data.get("runtime"), dict) else {}
-    paths = data.get("paths", {}) if isinstance(data.get("paths"), dict) else {}
-    ui = data.get("ui", {}) if isinstance(data.get("ui"), dict) else {}
+    server = _section(data, "server")
+    runtime = dict(_section(data, "runtime"))
+    ui = _section(data, "ui")
 
-    pipelines_dir = Path(
-        os.environ.get("GRAETL_PIPELINES_DIR") or paths.get("pipelines") or (base / "pipelines")
-    )
-    if not pipelines_dir.is_absolute():
-        pipelines_dir = (base / pipelines_dir).resolve()
+    opened = _resolve_project(base, data, project)
+    if opened is None and require_project:
+        raise NoProjectOpen(
+            "no GraETL project given. Pass a folder to `graetl serve <project>`, set "
+            f"GRAETL_PROJECT, or create one with `graetl new-project <folder>`."
+        )
 
-    settings = Settings(
+    raw: dict[str, Any] = dict(data)
+    if opened is not None:
+        # A project overrides the instance for anything it chooses to set: the
+        # knobs that matter (parallelism, batch size, cache) are properties of
+        # the warehouse, not of the machine that happens to be running it.
+        runtime.update(_section(opened.raw, "runtime"))
+        for key, value in opened.raw.items():
+            if key in ("runtime", "project", "target", "files", "paths"):
+                continue
+            raw[key] = value
+        raw["runtime"] = runtime
+
+    return Settings(
         root=base,
-        pipelines_dir=pipelines_dir,
+        project=opened,
         host=str(os.environ.get("GRAETL_HOST") or server.get("host", "127.0.0.1")),
         port=int(os.environ.get("GRAETL_PORT") or server.get("port", 8777)),
         log_retention_runs=int(runtime.get("log_retention_runs", 50)),
@@ -152,9 +220,38 @@ def load_settings(root: str | os.PathLike[str] | None = None) -> Settings:
             if os.environ.get("GRAETL_MONACO_URL") is not None
             else ui.get("monaco_url", MONACO_CDN)
         ).rstrip("/"),
-        raw=data,
+        raw=raw,
     )
-    return settings
+
+
+def _resolve_project(
+    base: Path, data: dict[str, Any], explicit: str | os.PathLike[str] | None
+) -> Project | None:
+    candidate: Path | None = None
+    if explicit:
+        candidate = Path(explicit)
+    elif os.environ.get("GRAETL_PROJECT"):
+        candidate = Path(os.environ["GRAETL_PROJECT"])
+    else:
+        configured = _section(data, "project").get("path")
+        if configured:
+            candidate = Path(str(configured))
+            if not candidate.is_absolute():
+                candidate = base / candidate
+        else:
+            # An instance root that is itself a project opens it; otherwise
+            # walk up from the working directory, the way git finds a repo.
+            candidate = find_project(base) or find_project(
+                os.environ.get("GRAETL_ROOT") or "."
+            )
+    if candidate is None:
+        return None
+    return Project.load(candidate)
+
+
+def _section(data: dict[str, Any], key: str) -> dict[str, Any]:
+    value = data.get(key)
+    return value if isinstance(value, dict) else {}
 
 
 def load_pipeline_config(pipeline_dir: Path) -> dict[str, Any]:
@@ -162,9 +259,25 @@ def load_pipeline_config(pipeline_dir: Path) -> dict[str, Any]:
     return read_toml(pipeline_dir / PIPELINE_CONFIG_FILENAME)
 
 
-def read_toml(path: Path) -> dict[str, Any]:
-    """Read a TOML file, returning ``{}`` when it does not exist."""
-    if not path.exists():
-        return {}
-    with path.open("rb") as fh:
-        return tomllib.load(fh)
+__all__ = [
+    "CONFIG_FILENAME",
+    "GRAPHLIB_SUFFIX",
+    "GRAPH_SUFFIX",
+    "MODULES_DIRNAME",
+    "MODULE_CONFIG_FILENAME",
+    "MODULE_CONFIG_SUFFIX",
+    "MODULE_FILE_SUFFIX",
+    "MONACO_CDN",
+    "MONACO_VERSION",
+    "NODES_FILE_SUFFIX",
+    "PIPELINE_CONFIG_FILENAME",
+    "PIPELINE_ENTRY_FILENAME",
+    "RUNTIME_DIRNAMES",
+    "NoProjectOpen",
+    "Project",
+    "ProjectError",
+    "Settings",
+    "load_pipeline_config",
+    "load_settings",
+    "read_toml",
+]

@@ -178,6 +178,7 @@ const api = {
 const state = {
   pipelines: [],
   health: null,
+  project: null,
   route: { view: "dashboard", id: null, tab: null },
   runSocket: null,
   runSocketId: null,
@@ -268,7 +269,7 @@ function renderHealth() {
   const h = state.health;
   $("#brand-sub").textContent = h ? `v${h.version} · ${h.active_runs} active` : "offline";
   $("#side-foot").innerHTML = h
-    ? `<div title="${esc(h.database)}">db · ${esc(h.database.split(/[\\/]/).slice(-2).join("/"))}</div>
+    ? `${h.database ? `<div title="${esc(h.database)}">db · ${esc(String(h.database).split(/[\\/]/).slice(-2).join("/"))}</div>` : ""}
        <div>ui · ${esc(h.ui)}</div>`
     : "server unreachable";
 }
@@ -3030,6 +3031,236 @@ function wireShortcuts() {
   });
 }
 
+/* ----------------------------------------------------------------- project */
+
+/* A GraETL instance opens exactly one project - one data warehouse. Started
+   without one, the server serves the console anyway and this picker completes
+   the startup; switching warehouses means restarting, so there is no
+   "close project" anywhere in the UI. */
+
+const picker = { path: null, mode: "recent", busy: false, error: "" };
+
+async function renderProject() {
+  const info = await api.get("/api/project");
+  state.project = info;
+  if (!info.open) {
+    picker.mode = (info.recent || []).length ? "recent" : "new";
+    await showPicker(info.recent || []);
+    return false;
+  }
+  $("#picker").hidden = true;
+  $(".shell").hidden = false;
+  const el = $("#project");
+  const target = info.target || {};
+  const bad = target.reachable === false;
+  el.hidden = false;
+  el.className = `project${bad ? " bad" : ""}`;
+  el.innerHTML = `
+    ${info.logo ? `<img class="project-logo" src="/api/project/logo" alt="" />` : ""}
+    <div class="project-text">
+      <div class="project-title" title="${esc(info.root)}">${esc(info.title)}</div>
+      <button class="project-target" id="project-target" title="${esc(target.describe || "")}">
+        ${bad ? "⚠ " : ""}${esc(target.describe || "no target")}
+      </button>
+    </div>`;
+  const button = $("#project-target");
+  if (button) {
+    button.addEventListener("click", (ev) => {
+      const items = [
+        { label: `Project  ${info.root}` },
+        { label: `Pipelines  ${info.pipelines_dir}` },
+        { label: `Files  ${info.files_root}` },
+        { label: `Target  ${target.describe || "-"}` },
+      ];
+      if (target.schema) items.push({ label: `Schema  ${target.schema}` });
+      if (bad) items.push({ label: `Unreachable: ${target.error || "unknown error"}` });
+      contextMenu(ev, items.map((i) => ({ ...i, onClick: () => {} })));
+    });
+  }
+  return true;
+}
+
+async function showPicker(recent) {
+  $(".shell").hidden = true;
+  const el = $("#picker");
+  el.hidden = false;
+  el.innerHTML = `
+    <div class="picker-card">
+      <div class="picker-head">
+        <div class="brand-mark">G</div>
+        <div>
+          <div class="picker-title">Open a project</div>
+          <div class="picker-sub">A project is one data warehouse and the pipelines that fill it.</div>
+        </div>
+      </div>
+      <div class="picker-tabs">
+        <button class="picker-tab" data-mode="recent">Recent</button>
+        <button class="picker-tab" data-mode="browse">Browse</button>
+        <button class="picker-tab" data-mode="new">New project</button>
+      </div>
+      ${picker.error ? `<div class="banner error">${esc(picker.error)}</div>` : ""}
+      <div class="picker-body" id="picker-body"></div>
+    </div>`;
+  el.querySelectorAll(".picker-tab").forEach((tab) => {
+    tab.classList.toggle("on", tab.dataset.mode === picker.mode);
+    tab.addEventListener("click", async () => {
+      picker.mode = tab.dataset.mode;
+      picker.error = "";
+      await showPicker(recent);
+    });
+  });
+  if (picker.mode === "recent") renderPickerRecent(recent);
+  else if (picker.mode === "browse") await renderPickerBrowse();
+  else renderPickerNew();
+}
+
+function renderPickerRecent(recent) {
+  const body = $("#picker-body");
+  if (!recent.length) {
+    body.innerHTML = `<div class="picker-empty">No projects opened yet.</div>`;
+    return;
+  }
+  body.innerHTML = `<div class="picker-list">${recent
+    .map(
+      (r, i) => `<div class="picker-row" data-i="${i}">
+        <div class="picker-row-main">
+          <div class="picker-row-title">${esc(r.title || r.name)}</div>
+          <div class="picker-row-path">${esc(r.root)}</div>
+        </div>
+        <span class="pill">${esc(r.target || "?")}</span>
+        <button class="icon-btn picker-forget" data-i="${i}" title="Remove from this list">×</button>
+      </div>`
+    )
+    .join("")}</div>`;
+  body.querySelectorAll(".picker-row").forEach((row) => {
+    row.addEventListener("click", () => openProject(recent[Number(row.dataset.i)].root));
+  });
+  body.querySelectorAll(".picker-forget").forEach((button) => {
+    button.addEventListener("click", async (ev) => {
+      ev.stopPropagation(); // forgetting must never also open it
+      const entry = recent[Number(button.dataset.i)];
+      const data = await api.post("/api/project/forget", { path: entry.root });
+      await showPicker(data.recent || []);
+    });
+  });
+}
+
+async function renderPickerBrowse() {
+  const body = $("#picker-body");
+  let data;
+  try {
+    data = await api.get(`/api/project/browse${picker.path ? `?path=${encodeURIComponent(picker.path)}` : ""}`);
+  } catch (err) {
+    body.innerHTML = `<div class="banner error">${esc(err.message)}</div>`;
+    return;
+  }
+  picker.path = data.path;
+  body.innerHTML = `
+    <div class="picker-path">${esc(data.path)}</div>
+    <div class="picker-list">
+      ${data.parent ? `<div class="picker-row up" data-up="1"><div class="picker-row-main">..</div></div>` : ""}
+      ${data.entries
+        .map(
+          (e, i) => `<div class="picker-row" data-i="${i}">
+            <div class="picker-row-main">${esc(e.name)}</div>
+            ${e.project ? `<span class="pill ok">project</span>` : ""}
+          </div>`
+        )
+        .join("")}
+    </div>
+    <div class="picker-actions">
+      <button class="btn" id="pick-here">Use this folder for a new project</button>
+    </div>`;
+  const up = body.querySelector(".picker-row.up");
+  if (up) up.addEventListener("click", async () => { picker.path = data.parent; await renderPickerBrowse(); });
+  body.querySelectorAll(".picker-row:not(.up)").forEach((row) => {
+    row.addEventListener("click", async () => {
+      const entry = data.entries[Number(row.dataset.i)];
+      if (entry.project) return openProject(entry.path);
+      picker.path = entry.path;
+      await renderPickerBrowse();
+    });
+  });
+  $("#pick-here").addEventListener("click", async () => {
+    picker.mode = "new";
+    await showPicker([]);
+  });
+}
+
+function renderPickerNew() {
+  const body = $("#picker-body");
+  const suggestion = picker.path ? `${picker.path}/warehouse` : "";
+  body.innerHTML = `
+    <div class="form">
+      <label>Folder<input id="np-path" value="${esc(suggestion)}" placeholder="/path/to/warehouse" /></label>
+      <label>Title<input id="np-title" placeholder="My Warehouse" /></label>
+      <label>Target database
+        <select id="np-system">
+          <option value="sqlite">SQLite (a file in the project)</option>
+          <option value="postgres">PostgreSQL</option>
+        </select>
+      </label>
+      <div id="np-pg" hidden>
+        <label>DSN<input id="np-dsn" placeholder="postgresql://user:\${PGPASSWORD}@host:5432/warehouse" /></label>
+        <label>Schema for GraETL's own tables<input id="np-schema" value="graetl" /></label>
+        <div class="hint">A \${VAR} in the DSN is read from the environment or a git-ignored .env, so no password is committed.</div>
+      </div>
+      <div class="picker-actions">
+        <button class="btn primary" id="np-create">Create project</button>
+      </div>
+    </div>`;
+  const system = $("#np-system");
+  system.addEventListener("change", () => { $("#np-pg").hidden = system.value !== "postgres"; });
+  $("#np-create").addEventListener("click", async () => {
+    if (picker.busy) return;
+    picker.busy = true;
+    try {
+      const payload = {
+        path: $("#np-path").value.trim(),
+        title: $("#np-title").value.trim(),
+        system: system.value,
+        dsn: system.value === "postgres" ? $("#np-dsn").value.trim() : "",
+        schema: system.value === "postgres" ? $("#np-schema").value.trim() || "graetl" : "graetl",
+      };
+      await api.post("/api/project/create", payload);
+      await enterConsole();
+    } catch (err) {
+      picker.error = err.message;
+      picker.busy = false;
+      await showPicker([]);
+      return;
+    }
+    picker.busy = false;
+  });
+}
+
+async function openProject(path) {
+  if (picker.busy) return;
+  picker.busy = true;
+  try {
+    await api.post("/api/project/open", { path });
+    await enterConsole();
+  } catch (err) {
+    picker.error = err.message;
+    const info = await api.get("/api/project").catch(() => ({ recent: [] }));
+    await showPicker(info.recent || []);
+  } finally {
+    picker.busy = false;
+  }
+}
+
+/** Finish startup once a project exists: load what boot() skipped. */
+async function enterConsole() {
+  picker.error = "";
+  state.health = await api.get("/api/health");
+  state.pipelines = await api.get("/api/pipelines");
+  await renderProject();
+  renderHealth();
+  renderSidebar();
+  await render();
+  connectSystemSocket();
+}
+
 async function boot() {
   $("#btn-sync").addEventListener("click", syncPipelines);
   $("#btn-new").addEventListener("click", openNewPipeline);
@@ -3039,11 +3270,19 @@ async function boot() {
   window.addEventListener("hashchange", render);
   wireShortcuts();
 
+  let opened = false;
   try {
     state.health = await api.get("/api/health");
-    state.pipelines = await api.get("/api/pipelines");
+    // Nothing else is worth loading until a warehouse is open - every other
+    // endpoint answers 503 until then.
+    opened = await renderProject();
+    if (opened) state.pipelines = await api.get("/api/pipelines");
   } catch (err) {
     toast(`Cannot reach the GraETL server: ${err.message}`, "error");
+  }
+  if (!opened) {
+    configureMonaco(state.health?.monaco_vendored ? "" : state.health?.monaco_url ?? "");
+    return;
   }
   // A vendored copy makes the editor fully offline; otherwise follow the
   // configured URL (an empty one means "stay offline, use the small editor").

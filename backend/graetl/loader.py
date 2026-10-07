@@ -98,6 +98,7 @@ def _exec_file(
     extra_sys_path: Path | None = None,
     *,
     isolate_imports: Path | None = None,
+    imported: list[Path] | None = None,
 ) -> Any:
     """Execute a Python file as a module, always from source.
 
@@ -145,11 +146,48 @@ def _exec_file(
                 origin = getattr(helper, "__file__", None)
                 if origin and str(Path(origin).resolve()).startswith(root + os.sep):
                     sys.modules.pop(name, None)
+                    if imported is not None:
+                        imported.append(Path(origin))
 
 
 #: Generated from a ``.graphlib`` graph. Loaded before module files, because a
 #: module (hand-written or generated) may call the functions it registers.
 GRAPHLIB_MODULE_SUFFIX = ".graphlib.py"
+
+
+def code_digest(path: Path, helpers: list[Path], base: Path) -> str:
+    """A stable digest of a module file and the helper files it imported.
+
+    Line endings are normalised, so a checkout on Windows and one on Linux
+    agree. Pipeline-wide code (pipeline.py, node libraries) is deliberately not
+    part of it: that is shared by every module, and bumping all of them for a
+    logging tweak would be noise. Version a shared function's semantics through
+    the modules that depend on it.
+    """
+    import hashlib
+
+    h = hashlib.sha256()
+    files = [path] + sorted({p.resolve() for p in helpers if p.suffix == ".py"} - {path.resolve()})
+    for file in files:
+        try:
+            data = Path(file).read_bytes().replace(b"\r\n", b"\n")
+        except OSError:  # pragma: no cover - vanished between load and hash
+            continue
+        if b"graetl:graph-digest" in data:
+            # A generated module: the digest line tracks the *document* (node
+            # positions included); the code below it is what matters.
+            data = b"\n".join(
+                line for line in data.split(b"\n") if b"graetl:graph-digest" not in line
+            )
+        if file == path:
+            name = "<module>"  # a rename must not look like a code change
+        else:
+            try:
+                name = Path(file).resolve().relative_to(path.parent.resolve()).as_posix()
+            except ValueError:  # pragma: no cover
+                name = Path(file).name
+        h.update(name.encode() + b"\0" + data + b"\0")
+    return h.hexdigest()[:16]
 
 
 def _rel(path: Path, base: Path) -> str:
@@ -251,6 +289,7 @@ def load_module_files(folder: Path, pipeline: Pipeline, *, pipeline_id: str) -> 
             "graphlibs": entry["graphlibs"],
         }
         before = {m.name for m in pipeline.modules}
+        helpers: list[Path] = []
         try:
             with pipeline_sdk.loading(
                 pipeline,
@@ -264,6 +303,7 @@ def load_module_files(folder: Path, pipeline: Pipeline, *, pipeline_id: str) -> 
                     f"graetl_pipeline_{safe_id}_module_{name.replace('-', '_')}",
                     extra_sys_path=directory,
                     isolate_imports=directory,
+                    imported=helpers,
                 )
         except Exception as exc:  # noqa: BLE001 - re-raised with the file that failed
             raise PipelineDefinitionError(
@@ -283,6 +323,10 @@ def load_module_files(folder: Path, pipeline: Pipeline, *, pipeline_id: str) -> 
                 "(helper code belongs in a plain .py file next to it)."
             )
         entry["modules"].extend(defined)
+        digest = code_digest(path, helpers, folder)
+        for m in pipeline.modules:
+            if m.name in defined:
+                m.code_hash = digest
 
     # A .graph with no compiled .module.py beside it is a module the registry
     # knows about but cannot run yet.

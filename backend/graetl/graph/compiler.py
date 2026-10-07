@@ -455,6 +455,18 @@ class GraphCompiler:
             statement = f"ctx.db.execute({args})"
             self._assign_or_call(node, "cursor", statement, out, desired="cursor")
             return
+        if op in ("core:write_rows", "core:upsert_rows"):
+            table = self.value_of(node, "table", out, required=True)
+            rows = self.value_of(node, "rows", out, required=True)
+            if op == "core:write_rows":
+                entity = self.value_of(node, "entity", out)
+                extra = f", entity={entity.text}" if entity is not None else ""
+                statement = f"ctx.write({table.text}, {rows.text}{extra})"
+            else:
+                key = self.value_of(node, "key", out, required=True)
+                statement = f"ctx.upsert({table.text}, {rows.text}, key={key.text})"
+            self._assign_or_call(node, "count", statement, out, desired="written")
+            return
         if op == "core:set_var":
             name = str(node.config["name"])
             value = self.value_of(node, "value", out, required=True)
@@ -1037,6 +1049,8 @@ def _node_label(node: Node, pin: str) -> str:
         base = str(node.config.get("name") or "result")
     elif node.op == "core:db_execute":
         base = "cursor"
+    elif node.op in ("core:write_rows", "core:upsert_rows"):
+        base = "written"
     elif node.kind == "py":
         base = node.ref.split(".")[-1]
     elif node.kind in ("fn", "graph"):

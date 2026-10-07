@@ -101,6 +101,9 @@ class Settings:
     lock_retries: int = 5
     #: Entries kept per cached pipeline function (see graetl.sdk.cached).
     cache_size: int = 4096
+    #: Refuse to run a module whose code changed while its version did not, when
+    #: entities were already processed at that version. Off: warn only.
+    strict_versions: bool = False
     python_executable: str | None = None
     #: Where the browser loads the Monaco editor from when no copy is vendored
     #: into ``static/vendor/vs``. Set it to "" to force the offline fallback.
@@ -214,6 +217,7 @@ def load_settings(
         entity_batch_size=int(runtime.get("entity_batch_size", 500)),
         lock_retries=int(runtime.get("lock_retries", 5)),
         cache_size=int(runtime.get("cache_size", 4096)),
+        strict_versions=_truthy(runtime.get("strict_versions", False)),
         python_executable=runtime.get("python_executable"),
         monaco_url=str(
             os.environ.get("GRAETL_MONACO_URL")
@@ -281,3 +285,9 @@ __all__ = [
     "load_settings",
     "read_toml",
 ]
+
+
+def _truthy(value: object) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)

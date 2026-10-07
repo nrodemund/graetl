@@ -122,6 +122,41 @@ class Context:
         """
         return self.state.conn
 
+    def write(
+        self,
+        table: str,
+        rows: Any,
+        *,
+        entity: Any = None,
+        key: Any = None,
+    ) -> int:
+        """Write rows **owned** by the current entity and module - the repeatable way.
+
+        ``rows`` is a dict, a list of dicts or a pandas DataFrame. Before the
+        module runs for an entity, every row it previously wrote for that entity
+        - in any table, at any version - is deleted in the same transaction, so
+        what is committed is exactly what this execution wrote::
+
+            ctx.write("labs", [{"case_id": entity.id, "code": c, "value": v} ...])
+
+        Running the module twice gives the same rows; version 1.1.7 producing
+        fewer rows than 1.1.6 leaves none of 1.1.6's behind. The table and any
+        new columns are created on first use. In a batch module pass
+        ``entity=`` to say which entity the rows belong to.
+        ``key=[...]`` additionally enforces uniqueness of those columns.
+        """
+        return self.state.outputs.write(table, rows, entity=entity, key=key)
+
+    def upsert(self, table: str, rows: Any, *, key: Any, entity: Any = None) -> int:
+        """Insert-or-update rows by ``key`` in a table shared between entities.
+
+        Idempotent, but never deletes: use it for dimension-like tables several
+        entities feed (lab code catalogue, patients). For an entity's own
+        results use :meth:`write`, which also retracts what an older version
+        produced.
+        """
+        return self.state.outputs.upsert(table, rows, key=key, entity=entity)
+
     def resource(self, name: str) -> Any:
         """A per-worker resource built by its ``@pipeline.resource`` factory.
 

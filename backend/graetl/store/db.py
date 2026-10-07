@@ -45,9 +45,10 @@ import random
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Iterator, Sequence
 
 BUSY_TIMEOUT_MS = 15_000
 
@@ -63,6 +64,7 @@ LOGICAL_TABLES = (
     "entity_module_state",
     "module_locks",
     "pipeline_meta",
+    "module_outputs",
 )
 
 
@@ -71,6 +73,17 @@ class LockConflict(RuntimeError):
 
     Never a failure of the work itself - nothing is recorded, and the entity or
     batch is simply attempted again.
+    """
+
+
+class LockLost(RuntimeError):
+    """This worker no longer holds the module lock it is writing under.
+
+    Raised inside an entity/batch transaction *before* its state row is
+    written, so the transaction rolls back and nothing is recorded: another
+    worker took the module over (its heartbeat went stale) and is now the only
+    one allowed to say "done". Continuing would let two workers write the same
+    module's results.
     """
 
 
@@ -151,6 +164,9 @@ class Dialect:
     ilike: str = "LIKE"
     #: PostgreSQL has no equivalent of BEGIN IMMEDIATE; it takes row locks.
     supports_immediate: bool = True
+    #: Row lock that conflicts with a concurrent UPDATE of the row. SQLite
+    #: serialises writers on the whole database, so it needs none.
+    for_share: str = ""
 
     def __init__(self, namespace: str = "graetl") -> None:
         self.namespace = namespace
@@ -170,7 +186,38 @@ class Dialect:
             if marker in sql:
                 sql = sql.replace(marker, self.table(logical))
         sql = sql.replace("[[ilike]]", self.ilike).replace("[[pk]]", self.pk)
+        if "[[" in sql:
+            sql = (
+                sql.replace("[[for_share]]", self.for_share)
+                .replace("[[seq_next]]", self.seq_next())
+                .replace("[[create_seq]]", self.create_seq())
+            )
         return sql
+
+    def seq_next(self) -> str:  # pragma: no cover - overridden
+        """An expression yielding the next processing sequence number."""
+        raise NotImplementedError
+
+    def create_seq(self) -> str:  # pragma: no cover - overridden
+        return ""
+
+    def quote(self, name: str) -> str:
+        """Quote a (possibly schema-qualified) identifier: ``dw.labs`` -> ``"dw"."labs"``."""
+        parts = str(name).split(".")
+        if not all(parts):
+            raise ValueError(f"invalid table name {name!r}")
+        return ".".join('"' + p.replace('"', '""') + '"' for p in parts)
+
+    def column_type(self, value: Any) -> str:  # pragma: no cover - overridden
+        raise NotImplementedError
+
+    def adapt(self, value: Any) -> Any:
+        """A Python value as the driver should receive it."""
+        if isinstance(value, (dict, list, tuple)):
+            import json
+
+            return json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
+        return value
 
     def is_lock_error(self, exc: BaseException) -> bool:  # pragma: no cover - overridden
         raise NotImplementedError
@@ -184,6 +231,38 @@ class SqliteDialect(Dialect):
 
     def table(self, logical: str) -> str:
         return f"{self.namespace}_{logical}"
+
+    def seq_next(self) -> str:
+        # SQLite serialises writers on the whole database, so MAX()+1 taken
+        # inside the writing statement is already a strictly increasing,
+        # commit-ordered sequence. The index makes it a single seek.
+        return (
+            f"(SELECT COALESCE(MAX(processed_seq), 0) + 1 "
+            f"FROM {self.table('entity_module_state')})"
+        )
+
+    def column_type(self, value: Any) -> str:
+        if isinstance(value, bool) or isinstance(value, int):
+            return "INTEGER"
+        if isinstance(value, float):
+            return "REAL"
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            return "BLOB"
+        from decimal import Decimal
+
+        if isinstance(value, Decimal):
+            return "NUMERIC"
+        return "TEXT"
+
+    def adapt(self, value: Any) -> Any:
+        from datetime import date, datetime, time as dtime
+        from decimal import Decimal
+
+        if isinstance(value, (datetime, date, dtime)):
+            return value.isoformat()
+        if isinstance(value, Decimal):
+            return str(value)
+        return super().adapt(value)
 
     def is_lock_error(self, exc: BaseException) -> bool:
         if not isinstance(exc, sqlite3.OperationalError):
@@ -200,8 +279,41 @@ class PostgresDialect(Dialect):
     ilike = "ILIKE"
     supports_immediate = False
 
+    for_share = " FOR SHARE"
+
     def table(self, logical: str) -> str:
         return f"{self.namespace}.{logical}"
+
+    def seq_next(self) -> str:
+        # nextval() is called while the row is written, i.e. after everything
+        # this transaction read was committed by its writers - so a consumer's
+        # number is always greater than that of the upstream row it read.
+        return f"nextval('{self.namespace}.state_seq')"
+
+    def create_seq(self) -> str:
+        return f"CREATE SEQUENCE IF NOT EXISTS {self.namespace}.state_seq;"
+
+    def column_type(self, value: Any) -> str:
+        from datetime import date, datetime, time as dtime
+        from decimal import Decimal
+
+        if isinstance(value, bool):
+            return "BOOLEAN"
+        if isinstance(value, int):
+            return "BIGINT"
+        if isinstance(value, float):
+            return "DOUBLE PRECISION"
+        if isinstance(value, Decimal):
+            return "NUMERIC"
+        if isinstance(value, datetime):
+            return "TIMESTAMPTZ" if value.tzinfo else "TIMESTAMP"
+        if isinstance(value, date):
+            return "DATE"
+        if isinstance(value, dtime):
+            return "TIME"
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            return "BYTEA"
+        return "TEXT"
 
     def sql(self, sql: str, *, params: bool = True) -> str:
         out = super().sql(sql, params=params)
@@ -304,7 +416,42 @@ class Database:
         return self.conn.execute(self.dialect.sql(sql), tuple(params))
 
     def executemany(self, sql: str, seq: Iterable[Sequence[Any]]) -> Any:
-        return self.conn.executemany(self.dialect.sql(sql), [tuple(p) for p in seq])
+        params = [tuple(p) for p in seq]
+        many = getattr(self.conn, "executemany", None)
+        if many is None:  # pgwire: executemany lives on the cursor
+            many = self.conn.cursor().executemany
+        return many(self.dialect.sql(sql), params)
+
+    def insert_many(
+        self,
+        head: str,
+        rows: Sequence[Sequence[Any]],
+        suffix: str = "",
+        *,
+        max_params: int = 30_000,
+    ) -> int:
+        """``head VALUES (...), (...) suffix`` for many rows, fast on both backends.
+
+        ``head`` is ``INSERT INTO t (a, b)``; ``suffix`` may carry an ``ON
+        CONFLICT`` clause. SQLite is in-process, so ``executemany`` is already
+        cheap; PostgreSQL pays a network round trip per statement, so rows are
+        sent as multi-row VALUES lists, chunked under the protocol's parameter
+        limit.
+        """
+        if not rows:
+            return 0
+        width = len(rows[0])
+        if self.dialect.name == "sqlite":
+            one = "(" + ", ".join("?" * width) + ")"
+            self.executemany(f"{head} VALUES {one} {suffix}", rows)
+            return len(rows)
+        per = max(1, max_params // max(width, 1))
+        one = "(" + ", ".join("?" * width) + ")"
+        for start in range(0, len(rows), per):
+            chunk = rows[start : start + per]
+            flat = [value for row in chunk for value in row]
+            self.execute(f"{head} VALUES {', '.join([one] * len(chunk))} {suffix}", flat)
+        return len(rows)
 
     def executescript(self, sql: str) -> None:
         """Run a multi-statement script (schema DDL)."""
@@ -389,6 +536,48 @@ class Database:
             pass
         finally:
             self._in_tx = False
+
+    @contextmanager
+    def savepoint(self, name: str = "graetl_sp") -> Iterator[None]:
+        """A nested unit inside the current transaction.
+
+        Used for schema changes made from module code: if a concurrent worker
+        created the same table first, only the savepoint is rolled back and the
+        surrounding entity transaction carries on.
+        """
+        self.execute(f"SAVEPOINT {name}")
+        try:
+            yield
+        except BaseException:
+            try:
+                self.execute(f"ROLLBACK TO SAVEPOINT {name}")
+                self.execute(f"RELEASE SAVEPOINT {name}")
+            except Exception:  # pragma: no cover - the outer rollback cleans up
+                pass
+            raise
+        else:
+            self.execute(f"RELEASE SAVEPOINT {name}")
+
+    def table_columns(self, table: str) -> list[str] | None:
+        """Column names of a warehouse table, or None when it does not exist."""
+        parts = str(table).split(".")
+        if self.dialect.name == "sqlite":
+            if len(parts) == 2:
+                sql = f'PRAGMA {self.dialect.quote(parts[0])}.table_info({self.dialect.quote(parts[1])})'
+            else:
+                sql = f"PRAGMA table_info({self.dialect.quote(parts[0])})"
+            rows = self.conn.execute(sql).fetchall()
+            return [r["name"] for r in rows] if rows else None
+        schema, name = (parts[0], parts[1]) if len(parts) == 2 else (None, parts[0])
+        if schema is None:
+            row = self.fetchone("SELECT current_schema() AS s")
+            schema = row["s"]
+        rows = self.fetchall(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = ? AND table_name = ? ORDER BY ordinal_position",
+            (schema, name),
+        )
+        return [r["column_name"] for r in rows] if rows else None
 
     def close(self) -> None:
         try:
@@ -491,6 +680,13 @@ def connect(target: Target) -> Database:
         conn = _connect_postgres(target.dsn)
         db = Database(conn, dialect, target=target)
         db.execute(f'CREATE SCHEMA IF NOT EXISTS "{target.schema}"')
+        # A login role named like GraETL's schema (user "graetl", schema
+        # "graetl") puts that schema first on the default search_path
+        # ("$user", public), so every unqualified warehouse table a pipeline
+        # creates would land among GraETL's bookkeeping. Keep them apart.
+        row = db.fetchone("SELECT current_schema() AS s")
+        if row is not None and row["s"] == target.schema:
+            db.execute("SET search_path TO public")
     else:
         if target.path is None:  # pragma: no cover - guarded by config loading
             raise TargetUnreachable("the sqlite target has no path")

@@ -185,3 +185,32 @@ that are safe to share.
 
 `Pipeline(max_attempts=n)` stops an entity from being retried forever in
 `incremental` mode; `retry-failed` always picks it up again.
+
+## Production guarantees (2026-10)
+
+* **Done means executed.** A state row is written only inside the unit's
+  transaction, after the module returned, together with its data. It records
+  `module_version`, `code_hash` (module file + imported helpers, line-ending
+  and rename stable) and `run_id`.
+* **Fencing.** Module locks are taken with one conditional upsert (atomic on
+  both backends), heartbeated by a `LockKeeper` thread with its own connection,
+  and re-checked inside every unit's transaction (`SELECT … FOR SHARE` on
+  PostgreSQL) before the state row is written. A worker that lost its lock gets
+  `LockLost`, rolls back, records nothing.
+* **Determinism.** `ctx.write` rows carry `_graetl_entity/_module/_version/_run`;
+  `module_outputs` remembers the tables. Every unit first deletes the module's
+  rows for its entities from all of them, in the same transaction. `ctx.upsert`
+  is the keyed, never-deleting variant for shared tables. Schema changes run in
+  a SAVEPOINT so a concurrent creator costs a re-inspection, not the entity.
+* **Cascade by sequence.** `processed_seq` (SQLite: `MAX()+1` under the writer
+  lock; PostgreSQL: a sequence) replaces wall-clock comparison; legacy rows
+  fall back to `processed_at`.
+* **Drift.** Same version, different `code_hash` is reported (module card,
+  drawer, run log, `version_drift` metric); `[runtime] strict_versions` refuses
+  to run such a module.
+* **Efficiency.** One commit per entity (no separate "running" commit);
+  discovery is one SELECT + one multi-row upsert per 500 entities; ready/waiting
+  counted in one scan; `max_attempts` filtered in SQL; planner statistics
+  refreshed after bulk changes (PostgreSQL otherwise picks quadratic plans);
+  state-heavy endpoints run in a thread pool; single-module batches use
+  immediate transactions so they never re-execute after a lost write race.

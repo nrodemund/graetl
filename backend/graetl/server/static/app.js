@@ -1,6 +1,7 @@
 import { configureMonaco, createEditor, languageFor } from "/editor.js";
 import { createGraphView } from "/graph.js";
 import { basename, createFileTree, dirname, join } from "/filetree.js";
+import { renderFlow } from "/flow.js";
 
 /* GraETL console ----------------------------------------------------------
  * The UI. Plain ES modules, no build step and no dependencies beyond Monaco,
@@ -524,6 +525,13 @@ function renderPipelineOverview(p, body) {
 
     ${p.description ? `<div class="panel"><div class="panel-body">${esc(p.description)}</div></div>` : ""}
 
+    ${def.modules?.length || def.tasks?.length ? `<div class="panel">
+      <div class="panel-head">Flow
+        <span class="dim" style="font-weight:400">execution order left to right · hover to trace · click a bar segment to list those entities</span>
+      </div>
+      <div class="panel-body" id="flow-host"><div class="empty">Loading…</div></div>
+    </div>` : ""}
+
     <div class="panel">
       <div class="panel-head">Steps
         <span class="dim" style="font-weight:400">double-click a module to edit its code · right-click for actions</span>
@@ -588,6 +596,26 @@ function renderPipelineOverview(p, body) {
     </div>` : ""}
 
     ${last?.error ? `<div class="banner">${esc(last.error)}</div>` : ""}`;
+
+  const flowHost = $("#flow-host", body);
+  if (flowHost) {
+    api.get(`/api/pipelines/${encodeURIComponent(p.id)}/flow`).then((flow) => {
+      if (!flowHost.isConnected) return;
+      renderFlow(flowHost, flow, {
+        onOpen: (name, file) => openSource(p.id, file, name),
+        onMenu: (ev, name, file) => moduleMenu(ev, p, name, file),
+        onSegment: (name, key) => {
+          const q = entityState();
+          q.module = name;
+          q.status = { failed: "failed", pending: "pending" }[key] || "";
+          q.offset = 0;
+          go(`#/p/${p.id}/entities`);
+        },
+      });
+    }).catch((err) => {
+      if (flowHost.isConnected) flowHost.innerHTML = `<div class="banner">${esc(err.message || err)}</div>`;
+    });
+  }
 
   const busy = !!p.active_run;
   $$("[data-run-step]", body).forEach((el) => el.addEventListener("click", () => {
@@ -947,6 +975,8 @@ async function openEntityDrawer(pipelineId, entityId, onChange) {
       <div class="table-wrap">
         ${rows.length ? `<table><thead><tr>
           <th>Module</th><th></th><th class="num">Layer</th><th>State</th><th class="num">v</th>
+          <th title="Code that produced this row, against the module as loaded now">Code</th>
+          <th class="num">Run</th>
           <th>Processed revision</th><th>Processed at</th><th class="num">Try</th>
           <th class="num">ms</th>
         </tr></thead><tbody>
@@ -954,6 +984,18 @@ async function openEntityDrawer(pipelineId, entityId, onChange) {
           const cls = { done: "succeeded", failed: "failed", running: "running", pending: "queued", skipped: "stopped" }[m.status] || "tag";
           const stale = m.processed_source_updated_at && entity.source_updated_at &&
             m.processed_source_updated_at < entity.source_updated_at;
+          const def = defs[m.module];
+          const processed = m.status === "done" || m.status === "skipped";
+          const outdated = processed && def && Number(def.version) !== Number(m.module_version);
+          const drift = processed && def && !outdated && def.code_hash && m.code_hash && def.code_hash !== m.code_hash;
+          const seqOf = Object.fromEntries((entity.modules || []).map((x) => [x.module, x.processed_seq]));
+          const upstreamNewer = processed && m.processed_seq != null && (def?.requires || []).some(
+            (r) => seqOf[r] != null && Number(seqOf[r]) > Number(m.processed_seq));
+          const codeCell = m.code_hash
+            ? `<span class="mono" title="${esc(m.code_hash)}">${esc(m.code_hash.slice(0, 7))}</span>${
+                drift ? ' <span class="pill stopped" title="same version, different code - bump the version">drift</span>'
+                : processed && def && !outdated && def.code_hash === m.code_hash ? ' <span title="produced by the code loaded now" style="color:var(--ok)">✓</span>' : ""}`
+            : '<span class="dim">–</span>';
           return `<tr class="row-entity-module" data-module="${esc(m.module)}"
               data-file="${esc(defs[m.module]?.file || "")}"
               title="Double-click to edit ${esc(defs[m.module]?.file || m.module)}">
@@ -963,8 +1005,10 @@ async function openEntityDrawer(pipelineId, entityId, onChange) {
               <button class="btn sm" data-reset="${esc(m.module)}" title="Forget this module's state for this entity">↺</button>
             </div></td>
             <td class="num dim">${defs[m.module]?.execution_layer ?? "–"}</td>
-            <td>${statusPill(cls, m.status)}${stale ? ' <span class="pill stopped">stale</span>' : ""}</td>
+            <td>${statusPill(cls, m.status)}${stale ? ' <span class="pill stopped">stale</span>' : ""}${outdated ? ` <span class="pill stopped" title="processed by v${esc(m.module_version)}, current is v${esc(def.version)} - the next run reprocesses it">outdated</span>` : ""}${!outdated && upstreamNewer ? ' <span class="pill stopped" title="a module it requires processed this entity again since - the next run reprocesses it">upstream changed</span>' : ""}</td>
             <td class="num">${m.module_version}</td>
+            <td>${codeCell}</td>
+            <td class="num">${m.run_id ? `<a href="#/runs/${m.run_id}" style="color:var(--accent)">#${m.run_id}</a>` : "–"}</td>
             <td class="mono dim">${esc(m.processed_source_updated_at || "–")}</td>
             <td class="dim">${esc(fmtTime(m.processed_at))}</td>
             <td class="num">${m.attempts}</td>

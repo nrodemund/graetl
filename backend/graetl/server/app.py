@@ -15,6 +15,7 @@ from typing import Any, AsyncIterator, Callable
 
 from pydantic import ValidationError
 from starlette.applications import Starlette
+from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
@@ -288,7 +289,113 @@ def create_app(settings: Settings | None = None) -> Starlette:
 
     async def get_pipeline(request: Request) -> Response:
         pid = request.path_params["pipeline_id"]
-        return _json(pipeline_payload(require_pipeline(pid)))
+        pipeline = require_pipeline(pid)
+        # Counting state over 100k entities must not stall the event loop that
+        # streams every live console.
+        return _json(await run_in_threadpool(pipeline_payload, pipeline))
+
+    def flow_payload(pipeline: dict[str, Any]) -> dict[str, Any]:
+        """The pipeline as a picture: layers, modules, edges, tables, health.
+
+        Everything is measured against the module definitions *as loaded now*,
+        so "current" means "done by this version, at the entity's current
+        source revision" - the question an operator actually asks.
+        """
+        pid = pipeline["id"]
+        definition = pipeline.get("definition") or {}
+        modules = definition.get("modules") or []
+        out_modules: list[dict[str, Any]] = []
+        tables: dict[str, dict[str, Any]] = {}
+        entities = 0
+        error = None
+        health: dict[str, Any] = {}
+        registry: list[dict[str, Any]] = []
+        work: dict[str, Any] = {}
+        if pipeline.get("stateful"):
+            try:
+                with settings.state_store(pid) as state:
+                    entities = state.count_entities()
+                    health = state.module_health(
+                        [(m["name"], int(m.get("version") or 1), m.get("code_hash") or None)
+                         for m in modules if m.get("scope") != "once"]
+                    )
+                    registry = state.outputs.registry()
+                    by_name = {m["name"]: m for m in modules}
+                    max_attempts = int(definition.get("max_attempts") or 0)
+                    for m in modules:
+                        if m.get("scope") == "once":
+                            continue
+                        requires = [
+                            (n, int(by_name[n].get("version") or 1))
+                            for n in (m.get("requires") or []) if n in by_name
+                        ]
+                        cascade = bool(definition.get("cascade", True))
+                        version = int(m.get("version") or 1)
+                        work[m["name"]] = state.work_breakdown(
+                            m["name"], version, requires=requires, cascade=cascade,
+                            max_attempts=max_attempts,
+                        )
+                        entry = health.get(m["name"])
+                        if entry is not None and cascade and requires:
+                            # "Current" by its own state, but an upstream module
+                            # has processed the entity since: it is due again.
+                            own = state.count_work(
+                                m["name"], version, requires=requires, cascade=False,
+                                apply_requirements=False, max_attempts=max_attempts,
+                            )
+                            due = state.count_work(
+                                m["name"], version, requires=requires, cascade=True,
+                                apply_requirements=False, max_attempts=max_attempts,
+                            )
+                            changed = max(0, min(due - own, entry["current"]))
+                            entry["upstream_changed"] = changed
+                            entry["current"] -= changed
+                            entry["drift"] = min(entry["drift"], entry["current"])
+            except Exception as exc:  # noqa: BLE001 - shown in the view
+                error = str(exc)
+        owned_by: dict[str, list[dict[str, Any]]] = {}
+        for row in registry:
+            owned_by.setdefault(row["module"], []).append(
+                {"table": row["table_name"], "mode": row["mode"]}
+            )
+        for m in modules:
+            outs = {o["table"]: o["mode"] for o in owned_by.get(m["name"], [])}
+            for declared in m.get("outputs") or []:
+                outs.setdefault(declared, "owned")
+            for table, mode in outs.items():
+                entry = tables.setdefault(table, {"table": table, "writers": []})
+                entry["writers"].append({"module": m["name"], "mode": mode})
+            out_modules.append({
+                "name": m["name"],
+                "title": m.get("title") or m["name"],
+                "version": m.get("version"),
+                "layer": m.get("execution_layer", 0),
+                "scope": m.get("scope", "entity"),
+                "source": m.get("source", "python"),
+                "file": m.get("file"),
+                "depends_on": m.get("depends_on") or [],
+                "requires": m.get("requires") or [],
+                "code_hash": m.get("code_hash") or "",
+                "description": m.get("description") or "",
+                "outputs": [{"table": t, "mode": md} for t, md in sorted(outs.items())],
+                "health": health.get(m["name"]),
+                "work": work.get(m["name"]),
+            })
+        return {
+            "pipeline": pid,
+            "stateful": bool(pipeline.get("stateful")),
+            "entities": entities,
+            "layers": sorted({m["layer"] for m in out_modules}),
+            "modules": out_modules,
+            "tasks": definition.get("tasks") or [],
+            "tables": sorted(tables.values(), key=lambda t: t["table"]),
+            "error": error,
+        }
+
+    async def get_flow(request: Request) -> Response:
+        pid = request.path_params["pipeline_id"]
+        pipeline = require_pipeline(pid)
+        return _json(await run_in_threadpool(flow_payload, pipeline))
 
     async def update_pipeline(request: Request) -> Response:
         pid = request.path_params["pipeline_id"]
@@ -1085,9 +1192,11 @@ def create_app(settings: Settings | None = None) -> Starlette:
         module = _qp(request, "module")
         limit = min(int(_qp(request, "limit", 100, int)), 2000)
         offset = int(_qp(request, "offset", 0, int))
-        with settings.state_store(pid) as state:
-            return _json(
-                {
+        order = _qp(request, "order", "entity_id")
+
+        def page() -> dict[str, Any]:
+            with settings.state_store(pid) as state:
+                return {
                     "total": state.count_entities(),
                     "matching": state.count_matching_entities(
                         search=search, status=status, module=module
@@ -1100,12 +1209,13 @@ def create_app(settings: Settings | None = None) -> Starlette:
                         search=search,
                         status=status,
                         module=module,
-                        order=_qp(request, "order", "entity_id"),
+                        order=order,
                     ),
                     "modules": state.module_summary(),
                     "statuses": state.status_counts(),
                 }
-            )
+
+        return _json(await run_in_threadpool(page))
 
     async def get_entity(request: Request) -> Response:
         pid = request.path_params["pipeline_id"]
@@ -1457,6 +1567,7 @@ def create_app(settings: Settings | None = None) -> Starlette:
         Route("/api/pipelines/{pipeline_id}/graph/preview", preview_graph),
         Route("/api/pipelines/{pipeline_id}/graph/preview", preview_graph, methods=["POST"]),
         Route("/api/pipelines/{pipeline_id}/nodes", node_catalog),
+        Route("/api/pipelines/{pipeline_id}/flow", get_flow),
         Route("/api/pipelines/{pipeline_id}/entities", list_entities),
         Route("/api/pipelines/{pipeline_id}/entities/{entity_id}", get_entity),
         Route(

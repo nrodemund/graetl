@@ -281,6 +281,34 @@ def _db_execute(node: Node, graph: Any) -> NodeDef:
     )
 
 
+def _write_rows(node: Node, graph: Any) -> NodeDef:
+    return _def(
+        "core:write_rows", "Write rows (owned)",
+        [exec_in(), _in("table", "str"), _in("rows", ANY),
+         _in("entity", ANY, default=None, has_default=True),
+         exec_out(), _out("count", "int")],
+        category=RUNTIME,
+        description=(
+            "ctx.write() - rows owned by this entity and module: reprocessing "
+            "replaces them, so the module is repeatable and a new version leaves "
+            "nothing of the old one behind"
+        ),
+    )
+
+
+def _upsert_rows(node: Node, graph: Any) -> NodeDef:
+    return _def(
+        "core:upsert_rows", "Upsert rows (by key)",
+        [exec_in(), _in("table", "str"), _in("rows", ANY), _in("key", ANY),
+         exec_out(), _out("count", "int")],
+        category=RUNTIME,
+        description=(
+            "ctx.upsert() - insert or update by key in a table shared between "
+            "entities; idempotent, never deletes"
+        ),
+    )
+
+
 def _resource(node: Node, graph: Any) -> NodeDef:
     return _def(
         "core:resource", "Resource",
@@ -565,6 +593,8 @@ BUILDERS: dict[str, Callable[[Node, Any], NodeDef]] = {
     "core:skip": _skip,
     "core:checkpoint": _checkpoint,
     "core:db_execute": _db_execute,
+    "core:write_rows": _write_rows,
+    "core:upsert_rows": _upsert_rows,
     "core:resource": _resource,
     "core:setting": _setting,
     "core:get_var": _get_var,

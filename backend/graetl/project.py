@@ -402,6 +402,7 @@ root = "{files}"
 # parallel_modules = 1
 # entity_batch_size = 500
 # cache_size = 4096
+# strict_versions = false  # true: refuse to run a module whose code changed without a version bump
 
 [graphs]
 # pure_modules = ["math", "statistics"]

@@ -806,3 +806,70 @@ body.resizing { cursor: col-resize; user-select: none; }
   background: var(--bg); color: var(--text); font: inherit; font-size: 13px;
 }
 .picker .hint { font-size: 11.5px; color: var(--muted); margin: -4px 0 10px; }
+
+/* pipeline flow ------------------------------------------------------------ */
+.flow-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+.flow-summary { font-weight: 600; color: var(--warn); }
+.flow-summary.good { color: var(--ok); }
+.flow-legend { display: flex; gap: 12px; flex-wrap: wrap; font-size: 12px; color: var(--text-dim); }
+.flow-legend span { display: inline-flex; align-items: center; gap: 5px; }
+.flow-legend i.seg { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+.flow-scroll { overflow-x: auto; padding-bottom: 6px; }
+.flow { position: relative; display: flex; gap: 46px; align-items: flex-start; min-width: min-content; padding: 4px 10px 4px 30px; }
+.flow-edges { position: absolute; left: 0; top: 0; pointer-events: none; overflow: visible; z-index: 0; }
+.flow-lane { position: relative; z-index: 1; display: flex; flex-direction: column; gap: 10px; width: 232px; flex: none; }
+.flow-lane + .flow-lane::before {
+  content: ""; position: absolute; left: -24px; top: 0; bottom: 0;
+  border-left: 1px dashed var(--border);
+}
+.flow-lane.tables { width: 200px; }
+.flow-lane-head {
+  font-size: 11px; font-weight: 700; letter-spacing: .6px; text-transform: uppercase;
+  color: var(--muted); padding: 0 2px 2px; cursor: default;
+}
+.fc {
+  background: var(--panel-2); border: 1px solid var(--border); border-radius: 9px;
+  padding: 9px 11px 10px; cursor: default; transition: opacity .12s, border-color .12s;
+}
+.fc[data-module]:hover { border-color: var(--accent); }
+.fc.task { background: var(--panel); border-style: dashed; }
+.fc.is-once { border-style: dashed; }
+.fc-top { display: flex; align-items: baseline; gap: 8px; }
+.fc-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
+.fc-ver { font-size: 12px; color: var(--accent); }
+.fc-meta { font-size: 11.5px; margin-top: 1px; }
+.fc-big { font-size: 22px; font-weight: 700; margin-top: 2px; font-variant-numeric: tabular-nums; }
+.fc-bar { display: flex; height: 7px; border-radius: 4px; overflow: hidden; background: var(--panel-3); margin: 8px 0 6px; gap: 1px; }
+.fc-bar.once { background: repeating-linear-gradient(135deg, var(--panel-3) 0 6px, var(--border) 6px 8px); }
+.fc-bar .seg { min-width: 3px; cursor: pointer; }
+.seg.ok { background: var(--ok); }
+.seg.drift { background: #c9a227; background: repeating-linear-gradient(135deg, var(--ok) 0 3px, var(--warn) 3px 6px); }
+.seg.warn { background: var(--warn); }
+.seg.err { background: var(--err); }
+.seg.pend { background: var(--accent); }
+.seg.never { background: var(--muted); opacity: .45; }
+.fc-nums { font-size: 12.5px; font-variant-numeric: tabular-nums; }
+.fc-ok { color: var(--ok); margin-left: 4px; font-weight: 700; }
+.fc-work { font-size: 12px; color: var(--accent); margin-top: 2px; }
+.fc-warn { font-size: 12px; color: var(--warn); margin-top: 4px; }
+.fc-versions { font-size: 11.5px; margin-top: 3px; display: flex; gap: 8px; flex-wrap: wrap; }
+.fc-versions .old { color: var(--warn); }
+.ft {
+  display: flex; flex-direction: column; background: var(--panel); border: 1px solid var(--border-soft);
+  border-left: 3px solid var(--accent); border-radius: 7px; padding: 7px 10px; font-size: 12.5px;
+}
+.ft .dim { font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.edge { fill: none; stroke: var(--border); stroke-width: 1.6; transition: stroke .12s, opacity .12s; }
+.edge.dep { stroke: #4b5f86; }
+.edge.out.owned { stroke: #3a5a8c; }
+.edge.out.upsert { stroke: #3a5a8c; stroke-dasharray: 5 4; }
+.flow.focusing .fc[data-module]:not(.hot), .flow.focusing .ft:not(.hot) { opacity: .35; }
+.flow.focusing .edge:not(.hot) { opacity: .15; }
+.edge.hot { stroke: var(--accent); stroke-width: 2.2; }
+@media (max-width: 700px) {
+  .flow { gap: 30px; padding-left: 20px; }
+  .flow-lane { width: 200px; }
+}
+.fc-outs { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 7px; }
+.fc-out { font: 11px var(--mono); padding: 1px 6px; border-radius: 5px; background: var(--panel-3); color: var(--text-dim); }
+.fc-out.upsert { border: 1px dashed var(--border); background: transparent; }

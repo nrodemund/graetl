@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import sys
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,6 +30,7 @@ from graetl.store.db import (  # noqa: E402
 )
 from graetl.store.core import CoreStore, RunStatus  # noqa: E402
 from graetl.store.state import StateStore  # noqa: E402
+from graetl.store.db import LockLost  # noqa: E402
 
 DSN = os.environ.get("GRAETL_TEST_DSN", "postgresql://graetl:graetl@127.0.0.1:5433/warehouse")
 SCHEMA = "graetl_test"
@@ -585,6 +587,122 @@ class TestOneSqlTwoBackends(unittest.TestCase):
         self.assertEqual(sqlite_result, postgres_result)
         self.assertEqual(sqlite_result[0], [("A", 10), ("B", 20)])
         self.assertEqual(sqlite_result[3], 1, "search is case-insensitive on both")
+
+
+class _Item:
+    def __init__(self, entity_id, rev=None):
+        self.entity_id = entity_id
+        self.source_updated_at = rev
+
+
+class TestDeterminismOnPostgres(PostgresTestCase):
+    """Owned outputs, fencing and the processing sequence - on a real server."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        admin = connect(Target(system="postgres", dsn=DSN, schema="public"))
+        admin.execute('DROP SCHEMA IF EXISTS "dw" CASCADE')
+        admin.execute('CREATE SCHEMA "dw"')
+        admin.close()
+
+    def _write(self, st, entity, version, rows, table="dw.labs"):
+        with st.entity_transaction(entity, "copy_labs", version, run_id=version,
+                                   source_updated_at=None):
+            st.outputs.write(table, rows)
+
+    def test_owned_rows_are_replaced_not_accumulated(self) -> None:
+        st = self.state()
+        st.upsert_entities([("C1", None, None, {}), ("C2", None, None, {})])
+        rows = [{"code": f"L{k}", "value": k * 1.5, "at": datetime(2026, 1, 1, tzinfo=timezone.utc)}
+                for k in range(3)]
+        for _ in range(2):
+            self._write(st, "C1", 1, rows)
+            self._write(st, "C2", 1, rows)
+        db = self.db()
+        self.assertEqual(db.fetchone("SELECT COUNT(*) AS n FROM dw.labs")["n"], 6)
+        self._write(st, "C1", 2, [{"code": "L0", "value": 0.0}])
+        got = db.fetchall("SELECT code, _graetl_version AS v FROM dw.labs "
+                          "WHERE _graetl_entity = 'C1'")
+        self.assertEqual([(r["code"], r["v"]) for r in got], [("L0", 2)])
+        col = db.fetchone("SELECT data_type FROM information_schema.columns "
+                          "WHERE table_schema = 'dw' AND table_name = 'labs' AND column_name = 'at'")
+        self.assertEqual(col["data_type"], "timestamp with time zone")
+
+    def test_a_failure_rolls_back_the_clearing_too(self) -> None:
+        st = self.state()
+        st.upsert_entities([("C1", None, None, {})])
+        self._write(st, "C1", 1, [{"code": "A", "value": 1.0}])
+        with self.assertRaises(RuntimeError):
+            with st.entity_transaction("C1", "copy_labs", 2, run_id=2, source_updated_at=None):
+                st.outputs.write("dw.labs", [{"code": "B", "value": 2.0, "extra": "new col"}])
+                raise RuntimeError("boom")
+        db = self.db()
+        self.assertEqual([r["code"] for r in db.fetchall("SELECT code FROM dw.labs")], ["A"])
+        # The column added inside the failed transaction is gone with it, and
+        # the writer's cache knows: the next write adds it again.
+        self._write(st, "C1", 3, [{"code": "C", "value": 3.0, "extra": "x"}])
+        self.assertEqual(db.fetchone("SELECT extra FROM dw.labs")["extra"], "x")
+
+    def test_upsert_is_idempotent_and_keeps_shared_rows(self) -> None:
+        st = self.state()
+        st.upsert_entities([("C1", None, None, {}), ("C2", None, None, {})])
+        for entity in ("C1", "C2", "C1"):
+            with st.entity_transaction(entity, "codes", 1, run_id=1, source_updated_at=None):
+                st.outputs.upsert("dw.codes", [{"code": "CREA", "unit": "mg/dl"},
+                                               {"code": "CREA", "unit": "mg/dL"}], key="code")
+        rows = self.db().fetchall("SELECT code, unit FROM dw.codes")
+        self.assertEqual([(r["code"], r["unit"]) for r in rows], [("CREA", "mg/dL")])
+
+    def test_two_workers_writing_one_new_table(self) -> None:
+        a, b = self.state(), self.state()
+        a.upsert_entities([("C1", None, None, {}), ("C2", None, None, {})])
+        with a.entity_transaction("C1", "m1", 1, run_id=1, source_updated_at=None):
+            a.outputs.write("dw.shared", {"x": 1})
+        with b.entity_transaction("C2", "m2", 1, run_id=1, source_updated_at=None):
+            b.outputs.write("dw.shared", {"x": 2, "y": "b"})
+        rows = self.db().fetchall("SELECT x, y, _graetl_module AS m FROM dw.shared ORDER BY x")
+        self.assertEqual([(r["x"], r["y"], r["m"]) for r in rows], [(1, None, "m1"), (2, "b", "m2")])
+
+    def test_a_lost_lock_cannot_record_done(self) -> None:
+        a, b = self.state(), self.state()
+        a.upsert_entities([("E", None, None, {})])
+        a.acquire_module_lock("m", run_id=1)
+        with self.assertRaises(LockConflict):
+            b.acquire_module_lock("m", run_id=2)
+        self.db().execute("UPDATE [[module_locks]] SET heartbeat_at = '2000-01-01T00:00:00.000Z'")
+        b.acquire_module_lock("m", run_id=2)
+        with self.assertRaises(LockLost):
+            with a.entity_transaction("E", "m", 1, run_id=1, source_updated_at=None):
+                a.outputs.write("dw.out", {"v": 1})
+        self.assertIsNone(self.db().fetchone("SELECT 1 AS x FROM [[entity_module_state]]"))
+
+    def test_cascade_by_sequence_and_breakdown(self) -> None:
+        st = self.state()
+        st.upsert_entities([("A", None, None, {}), ("B", None, None, {})])
+        for module in ("up", "down"):
+            with st.entity_transaction("A", module, 1, run_id=1, source_updated_at=None):
+                pass
+        st.db.execute("UPDATE [[entity_module_state]] SET processed_at = '2026-01-01T00:00:00.000Z'")
+        self.assertEqual(st.work_breakdown("down", 1, requires=[("up", 1)]),
+                         {"due": 1, "ready": 0, "waiting": 1})
+        with st.entity_transaction("A", "up", 1, run_id=2, source_updated_at=None):
+            pass
+        self.assertEqual(st.count_work("down", 1, requires=[("up", 1)]), 1)
+        health = st.module_health([("up", 1, None), ("down", 1, None)])
+        self.assertEqual((health["up"]["current"], health["up"]["never"]), (1, 1))
+
+    def test_warehouse_tables_never_land_in_graetls_schema(self) -> None:
+        user = DSN.split("://", 1)[1].split(":", 1)[0].split("@", 1)[0]
+        db = self.track(connect(Target(system="postgres", dsn=DSN, schema=user)))
+        self.assertNotEqual(db.fetchone("SELECT current_schema() AS s")["s"], user)
+
+    def test_bulk_entity_upsert_in_one_statement(self) -> None:
+        st = self.state()
+        stats = st.upsert_entities([(f"E{i}", None, f"r{i}", {"i": i}) for i in range(2500)])
+        self.assertEqual(stats["new"], 2500)
+        stats = st.upsert_entities([(f"E{i}", None, "r9999", None) for i in range(10)])
+        self.assertEqual((stats["new"], stats["changed"]), (0, 10))
+        self.assertEqual(st.get_entity("E3")["payload"], {"i": 3})
 
 
 if __name__ == "__main__":  # pragma: no cover

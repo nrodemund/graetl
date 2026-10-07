@@ -70,11 +70,21 @@ class Module:
     #:             with no entity and no entity state. For global work: rebuild
     #:             a summary table, vacuum, export the lot.
     scope: str = "entity"
+    #: Digest of the code that defines the module: its file plus the helper
+    #: files it imported from its folder. Recorded on every state row, so
+    #: "done at v7" also says *which* v7 - and a code change without a version
+    #: bump is visible instead of silently mixing results.
+    code_hash: str = ""
+    #: Tables this module declares it owns (``ctx.write``). Optional: writing
+    #: registers a table on its own. Declared ones are shown before the first run.
+    outputs: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "name": self.name,
             "kind": "module",
+            "code_hash": self.code_hash,
+            "outputs": list(self.outputs),
             "source": self.source,
             "scope": self.scope,
             "version": self.version,
@@ -351,6 +361,7 @@ class Pipeline:
         batch_size: int | None = None,
         scope: str = "entity",
         meta: dict[str, Any] | None = None,
+        outputs: Sequence[str] | str = (),
     ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
         """Register a module. By default entity-scoped: ``fn(ctx, entity)``.
 
@@ -377,6 +388,13 @@ class Pipeline:
         everything below that layer is up to date - and keeps no entity state,
         so it runs on every run. It is the right shape for work that is about
         the whole table rather than one row.
+
+        ``outputs`` names the tables the module writes with ``ctx.write``. Rows
+        written that way are owned by (entity, module): reprocessing an entity
+        replaces them, so the module is repeatable and a new version fully
+        replaces the old version's results. Declaring is optional - the first
+        write registers a table - but declared tables show in the flow view
+        before anything has run.
         """
         if scope not in ("entity", "batch", "once"):
             raise PipelineDefinitionError(
@@ -409,6 +427,7 @@ class Pipeline:
                     ),
                     batch_size=batch_size,
                     scope=scope,
+                    outputs=(outputs,) if isinstance(outputs, str) else tuple(outputs),
                     seq=self._seq,
                     file=file,
                     folder=folder,
@@ -518,6 +537,13 @@ class Pipeline:
     def validate(self) -> None:
         self.ordered_modules()
         by_name = {m.name: m for m in self.modules}
+        if self.execution == "entity-major":
+            odd = [m.name for m in self.modules if m.scope != "entity"]
+            if odd:
+                raise PipelineDefinitionError(
+                    "execution='entity-major' walks one entity at a time through the chain, "
+                    f"so every module must be scope='entity' - not: {', '.join(odd)}"
+                )
         for module in self.modules:
             for dep in module.depends_on:
                 target = by_name[dep]

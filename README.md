@@ -325,7 +325,9 @@ A pipeline can mix both: tasks run before (`phase="pre"`, the default) and after
 | --- | --- |
 | `ctx.config`, `ctx.setting("source.dsn", default)` | `pipeline.toml` |
 | `ctx.dir`, `ctx.data_dir`, `ctx.path("data/in.csv")` | paths inside the pipeline folder |
-| `ctx.db` | the pipeline's SQLite connection (see *Transactional safety*) |
+| `ctx.write("table", rows)` | rows **owned** by this entity + module — reprocessing replaces them (see *Deterministic modules*) |
+| `ctx.upsert("table", rows, key=[...])` | insert-or-update by key in a table shared between entities |
+| `ctx.db` | the project's target database, same transaction as the state row (see *Transactional safety*) |
 | `ctx.fn("name")` | a shared function registered with `@pipeline.function` |
 | `ctx.resource("name")` | this worker's own connection/session (see *Running modules in parallel*) |
 | `ctx.state` | the `StateStore` for advanced queries |
@@ -406,7 +408,8 @@ immutable values, unsafe for connections once `parallel_modules > 1`.
 
 ## How resuming works
 
-`state.db` has two tables:
+GraETL's bookkeeping lives in the project's target database (`graetl_*` tables
+on SQLite, schema `graetl` on PostgreSQL), next to the warehouse tables.
 
 **`entities`** — one row per business entity, with `source_updated_at`: the
 **source revision**, i.e. the moment the entity last changed in the source
@@ -418,19 +421,45 @@ an ETag.
 **`entity_module_state`** — one row per (entity, module), recording
 
 * `module_version` — which version of the module produced this state,
+* `code_hash` — a digest of the module file and the helper files it imported,
+  i.e. *which* code at that version,
 * `processed_source_updated_at` — **which source revision was processed**,
-* `processed_at`, `attempts`, `status`, `error`, `duration_ms`, `run_id`.
+* `processed_seq` — a commit-ordered processing number (used for cascades),
+* `run_id`, `processed_at`, `attempts`, `status`, `error`, `duration_ms`.
 
 A module has work to do for an entity when **any** of these is true:
 
 1. there is no state row yet,
-2. the row is not `done`,
+2. the row is not `done` / `skipped`,
 3. the module's `version=` was bumped (change the logic → bump the version →
-   only that module reprocesses everything),
-4. `processed_source_updated_at < entities.source_updated_at` — the source moved.
+   that module reprocesses everything),
+4. `processed_source_updated_at < entities.source_updated_at` — the source moved,
+5. a module it requires processed the entity **after** it did (cascade) — so a
+   version bump upstream refreshes everything derived from it.
 
-Plus: a module with `depends_on=[...]` only runs for entities whose upstream
-modules are `done`.
+…and it only runs once every lower execution layer (and every `depends_on`)
+is up to date for that entity. An entity that failed `max_attempts` times at
+the current version and source revision waits for a new version, a source
+change or a `retry-failed` run.
+
+### "Done" means done
+
+When the entity drawer says `copy_labs · done · v7 · 56408c4 ✓ · run #42`, all
+of this holds:
+
+* the module function **returned** for that entity, in run 42 — the row is
+  written in the same transaction as the module's data, after it returns;
+* it ran as **version 7**, with the code whose digest is `56408c4` (✓ = the
+  code loaded now; `drift` = same version, different code; `outdated` = another
+  version; `upstream changed` = will be redone because a requirement moved);
+* it held the module's **lock** when it committed. Locks are heartbeated from
+  a thread of their own, a dead worker's lock is taken over after 90 s, and
+  every unit re-checks ownership inside its transaction before writing "done"
+  (fencing) — a worker that lost its lock rolls back and records nothing.
+
+A code change without a version bump is reported on the module card, in the
+run log and in the run metrics (`version_drift`). With
+`[runtime] strict_versions = true` such a module refuses to run instead.
 
 ### Run modes
 
@@ -442,25 +471,59 @@ modules are `done`.
 
 ### Transactional safety
 
-Module code writes through `ctx.db` — the *same* SQLite connection that holds
-the state table. GraETL wraps each (entity, module) execution in one
-transaction that covers both the module's data writes and the state row update:
+Module code writes through `ctx.db` / `ctx.write` — the *same* connection that
+holds the state table. GraETL wraps each (entity, module) execution in one
+transaction that covers the module's data writes and the state row:
 
 ```
-BEGIN IMMEDIATE
-  <your INSERT/UPDATE statements>
-  UPDATE entity_module_state SET status='done', processed_source_updated_at=…
+BEGIN
+  DELETE the module's previously owned rows for this entity
+  <your writes>
+  check the module lock is still ours
+  UPSERT entity_module_state SET status='done', module_version, code_hash, run_id, …
 COMMIT
 ```
 
 So "state says done but the data was never written" cannot happen, and a
 rolled-back entity is recorded as `failed` with its error while every other
-entity's work stays committed. Writes to systems *outside* that connection
-(a remote database, an API) are at-least-once: the state row only flips to
-`done` after the module returns, so an interrupted entity is retried on resume.
+entity's work stays committed. A batch module's batch is one such unit; a
+`scope="once"` module is one unit without state rows. `RetryEntity` rolls the
+attempt back and leaves the entity `pending`; a stop leaves it `pending` and
+does not count as an attempt. Writes to systems *outside* that connection
+(a remote database, an API, files) are at-least-once: the state row only flips
+to `done` after the module returns, so an interrupted entity is retried.
 
-Interrupted work (`status = running` left behind by a killed process) is reset
-to `pending` at the start of the next run.
+### Deterministic modules
+
+A module should give the same result every time it runs for the same entity at
+the same version, and a new version should *replace* the old version's result.
+Plain `INSERT`s get neither: running twice doubles rows, and v1.1.7 producing
+fewer rows than v1.1.6 leaves v1.1.6's extras behind. Use `ctx.write`:
+
+```python
+@pipeline.module(version=7, outputs=["labs"])
+def copy_labs(ctx, entity):
+    rows = [{"case_id": entity.id, "code": c, "value": v} for c, v in read_labs(entity)]
+    ctx.write("labs", rows)          # list of dicts, one dict, or a DataFrame
+```
+
+Every row is tagged with `_graetl_entity`, `_graetl_module`, `_graetl_version`
+and `_graetl_run`, and GraETL remembers every table a module has written. When
+the module's unit opens for an entity, **all its rows for that entity are
+deleted from all those tables** in the same transaction, then the module runs.
+Same version twice → same rows. New version → nothing of the old one survives,
+including in tables the new version no longer writes. A failure rolls the
+deletion back too. The table and new columns are created from the rows on
+first use; `outputs=` is optional and only makes the tables visible in the flow
+view before the first run. In a batch module pass `entity=e`.
+
+For tables several entities feed (a lab-code catalogue, a patient table) use
+`ctx.upsert("lab_code", rows, key="code")`: insert-or-update by key, idempotent,
+never deleted on reprocess. Both exist as graph nodes: **Write rows (owned)**
+and **Upsert rows (by key)**.
+
+Renaming a module carries its lineage; deleting a module file deletes its owned
+rows.
 
 ---
 
@@ -975,6 +1038,23 @@ to win by bundling — the console loads in about 100 ms.
 The only optional asset is Monaco, which is lazy-loaded on the Files tab and can
 be vendored for offline use (`graetl vendor-monaco`).
 
+### The flow view
+
+A pipeline's Overview tab opens with its **flow**: source, then one lane per
+execution layer, left to right in execution order, then the tables. A dashed
+lane boundary is a barrier — everything to its left is up to date for an entity
+before anything to its right touches it. `depends_on` edges are drawn; the
+implied "all lower layers" edges are not, the barrier already says it.
+
+Each module card shows its version, scope and code digest, and a bar measured
+against the **current** definition: current · code drift · outdated (other
+version, source or upstream changed) · failed · pending · not yet. Below it:
+how many entities a run would process now and how many wait for upstream, the
+tables it writes (→ owned, ⇢ upserted), and a warning when its code changed
+without a version bump. Hover traces a module's dependencies and tables; click
+a bar segment to list exactly those entities; double-click opens the code;
+right-click has the run/debug/reset menu.
+
 ---
 
 ## HTTP API
@@ -988,6 +1068,7 @@ be vendored for offline use (`graetl vendor-monaco`).
 | `POST` | `/api/pipelines/sync` | rescan the folder |
 | `PATCH`/`DELETE` | `/api/pipelines/{id}` | enable/disable, remove |
 | `GET`/`PUT` | `/api/pipelines/{id}/file?path=…` | read/write pipeline code |
+| `GET` | `/api/pipelines/{id}/flow` | layers, modules, health against the current version/code, pending work, output tables |
 | `GET` | `/api/pipelines/{id}/entities` | entity state |
 | `POST` | `/api/pipelines/{id}/state/reset` | clear processing state |
 | `POST` | `/api/pipelines/{id}/runs` | start a run (`mode`, `steps`, `entity_ids`, `profile`) |

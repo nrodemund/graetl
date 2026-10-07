@@ -19,8 +19,82 @@ from graetl.runner.telemetry import ProcessSampler
 from graetl.sdk.context import EntityContext
 from graetl.sdk.errors import AbortRun, RetryEntity, SkipEntity, StopRequested
 from graetl.sdk.pipeline import Entity, Module, Task
-from graetl.store.state import STATUS_DONE, STATUS_SKIPPED, LockConflict, StateStore
+from graetl.store.state import (
+    STATUS_DONE,
+    STATUS_SKIPPED,
+    LockConflict,
+    LockLost,
+    StateStore,
+)
 from graetl.utils import elapsed_ms, now_iso, truncate
+
+
+class LockKeeper:
+    """Heartbeats every module lock this run holds, from a thread of its own.
+
+    Beating between entities is not enough: one entity that takes longer than
+    the stale threshold would let another process take the module over while
+    this one is still writing. The keeper has its own connection (a connection
+    is never shared between threads) and beats every ``interval`` seconds no
+    matter what the workers are doing. Fencing in the state store is the
+    second line: even a lock that *was* taken over cannot be written under.
+    """
+
+    def __init__(self, open_store, interval: float = 15.0) -> None:
+        self._open_store = open_store
+        self._interval = interval
+        self._held: dict[str, str] = {}
+        self._lost: set[str] = set()
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._store: StateStore | None = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._loop, name="graetl-locks", daemon=True)
+        self._thread.start()
+
+    def hold(self, module: str, owner: str) -> None:
+        with self._lock:
+            self._held[module] = owner
+            self._lost.discard(module)
+
+    def release(self, module: str) -> None:
+        with self._lock:
+            self._held.pop(module, None)
+
+    def lost(self, module: str) -> bool:
+        with self._lock:
+            return module in self._lost
+
+    def _loop(self) -> None:
+        while not self._stop.wait(self._interval):
+            with self._lock:
+                held = dict(self._held)
+            if not held:
+                continue
+            try:
+                if self._store is None:
+                    self._store = self._open_store()
+                for module, owner in held.items():
+                    if not self._store.heartbeat_module_lock(module, owner):
+                        with self._lock:
+                            if module in self._held:
+                                self._lost.add(module)
+            except Exception:  # pragma: no cover - a missed beat is retried
+                try:
+                    if self._store is not None:
+                        self._store.close()
+                finally:
+                    self._store = None
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+        if self._store is not None:
+            self._store.close()
+            self._store = None
 
 
 class RunResult:
@@ -76,6 +150,8 @@ class Executor:
         self.debug = bool(self.params.get("debug"))
         self._sampler = ProcessSampler()
         self._stop_sampling = threading.Event()
+        self._keeper: LockKeeper | None = None
+        self.strict_versions = bool(getattr(settings, "strict_versions", False))
 
     # ------------------------------------------------------------------ setup
 
@@ -125,6 +201,8 @@ class Executor:
             if pipeline.stateful:
                 self.state = self.settings.state_store(pipeline.id)
                 ctx._state = self.state
+                self._keeper = LockKeeper(lambda: self.settings.state_store(pipeline.id))
+                self._keeper.start()
                 healed = self.state.reset_stale_running()
                 if healed:
                     ctx.warn(
@@ -154,6 +232,8 @@ class Executor:
             self.writer.log(truncate(traceback.format_exc()), level="error")
         finally:
             self._stop_sampling.set()
+            if self._keeper is not None:
+                self._keeper.stop()
             try:
                 self._call_lifecycle("teardown", pipeline.teardown_fn, ctx, swallow=True)
                 for name in ctx.close_resources():
@@ -379,6 +459,8 @@ class Executor:
                 ctx.warn(f"{removed} entity/entities disappeared from the source (soft-deleted).")
                 self._counters["entities_removed"] = removed
 
+        if stats["new"] or stats["changed"]:
+            self.state.refresh_statistics()
         self._counters["entities_new"] = stats["new"]
         self._counters["entities_changed"] = stats["changed"]
         self._counters["entities_seen"] = stats["seen"]
@@ -468,6 +550,11 @@ class Executor:
             for batch in self._sub_levels(layer_modules):
                 self._guard()
                 width = min(parallel, len(batch))
+                # Deferred transactions only where modules really overlap: a
+                # module alone in its batch takes the write lock up front and
+                # never has to re-execute its body after losing a write race
+                # (e.g. to the server recording run progress).
+                self._tx_mode = "deferred" if width > 1 else "immediate"
                 if width > 1:
                     ctx.info(
                         f"Execution layer {layer}: running {len(batch)} module(s) "
@@ -529,9 +616,13 @@ class Executor:
                         self._counters.get("lock_conflicts", 0) + 1
                     )
                 raise AbortRun(f"module {module.name} is locked by another worker") from exc
+            if self._keeper is not None:
+                self._keeper.hold(module.name, owner)
             try:
                 self._run_module(ctx, module, entity_filter, state, owner)
             finally:
+                if self._keeper is not None:
+                    self._keeper.release(module.name)
                 state.release_module_lock(module.name, owner)
         finally:
             failed = ctx.close_resources()
@@ -601,65 +692,57 @@ class Executor:
                 self._counters["waiting_for_upstream"] = sum(pending.values())
                 self._counters["upstream_pending"] = pending
 
+    def _max_attempts(self) -> int:
+        """Failed-entity blocking applies to ordinary incremental runs only."""
+        return self.pipeline.max_attempts if self.mode == "incremental" else 0
+
     def _select(
         self,
         module: Module,
         entity_filter: list[str] | None,
         state: StateStore | None = None,
         *,
-        ctx=None,
         after: str | None = None,
         limit: int | None = None,
         order: str = "entity_id",
     ):
         store = state or self.state
         assert store is not None
-        requires = self.pipeline.requirements_for(module)
-        items = store.select_work(
+        return store.select_work(
             module.name,
             module.version,
             mode=self.mode,
-            requires=requires,
+            requires=self.pipeline.requirements_for(module),
             cascade=self.pipeline.cascade,
             entity_ids=entity_filter,
             after=after,
             limit=limit,
             order=order,
+            max_attempts=self._max_attempts(),
         )
-        if requires and ctx is not None and after is None:
-            # Entities this module is due for, but whose lower layers / dependencies
-            # have not caught up. Worth saying out loud when a single module is run.
-            waiting = store.count_work(
-                module.name, module.version, mode=self.mode,
-                requires=requires, cascade=self.pipeline.cascade,
-                entity_ids=entity_filter, apply_requirements=False,
-            ) - store.count_work(
-                module.name, module.version, mode=self.mode,
-                requires=requires, cascade=self.pipeline.cascade,
-                entity_ids=entity_filter,
-            )
-            if waiting > 0:
-                names = ", ".join(f"{n} v{v}" for n, v in requires)
-                ctx.warn(
-                    f"[{module.name}] {waiting} entity/entities are waiting for upstream "
-                    f"work ({names}). Run the whole pipeline to bring them up to date."
-                )
-                with self._counters_lock:
-                    self._counters["waiting_for_upstream"] = (
-                        self._counters.get("waiting_for_upstream", 0) + waiting
-                    )
-        max_attempts = self.pipeline.max_attempts
-        if self.mode == "incremental" and max_attempts > 0:
-            blocked = {
-                i.entity_id
-                for i in items
-                if i.previous_status == "failed" and i.attempts >= max_attempts
-            }
-            if blocked:
-                items = [i for i in items if i.entity_id not in blocked]
-                with self._counters_lock:
-                    self._counters["blocked"] = self._counters.get("blocked", 0) + len(blocked)
-        return items
+
+    def _check_version_drift(self, ctx: EntityContext, module: Module, store: StateStore) -> None:
+        """Same version, different code: results would no longer be reproducible.
+
+        A module's version is the promise "same version, same results". If the
+        code changed but the version did not, entities processed before the
+        change and after it carry the same version and different results. That
+        is reported loudly - and refused with ``strict_versions``.
+        """
+        drift = store.drift_count(module.name, module.version, module.code_hash)
+        if not drift:
+            return
+        message = (
+            f"[{module.name}] code changed since {drift} entity/entities were processed at "
+            f"v{module.version} - bump the version so they are reprocessed, otherwise "
+            "results at this version depend on when an entity happened to run."
+        )
+        with self._counters_lock:
+            self._counters.setdefault("version_drift", {})[module.name] = drift
+        if self.strict_versions:
+            ctx.error(message + " (strict_versions is on: not running it)")
+            raise AbortRun(f"module {module.name}: code changed without a version bump")
+        ctx.warn(message)
 
     def _run_module(
         self,
@@ -682,14 +765,34 @@ class Executor:
         # never materialises the whole backlog and always terminates: an entity
         # that fails stays behind the cursor instead of being picked up again.
         sample_limit = self.params.get("limit_entities")
-        available = store.count_work(
+        self._check_version_drift(ctx, module, store)
+        requires = self.pipeline.requirements_for(module)
+        breakdown = store.work_breakdown(
             module.name,
             module.version,
             mode=self.mode,
-            requires=self.pipeline.requirements_for(module),
+            requires=requires,
             cascade=self.pipeline.cascade,
             entity_ids=entity_filter,
+            max_attempts=self._max_attempts(),
         )
+        available = breakdown["ready"]
+        if requires and breakdown["waiting"] > 0:
+            # Due for this module, but a lower layer / dependency has not caught
+            # up. Worth saying out loud when a single module is run.
+            names = ", ".join(f"{n} v{v}" for n, v in requires)
+            ctx.warn(
+                f"[{module.name}] {breakdown['waiting']} entity/entities are waiting for "
+                f"upstream work ({names}). Run the whole pipeline to bring them up to date."
+            )
+            with self._counters_lock:
+                self._counters["waiting_for_upstream"] = (
+                    self._counters.get("waiting_for_upstream", 0) + breakdown["waiting"]
+                )
+        blocked = store.blocked_count(module.name, module.version, self._max_attempts())
+        if blocked:
+            with self._counters_lock:
+                self._counters["blocked"] = self._counters.get("blocked", 0) + blocked
         if sample_limit:
             total = min(int(sample_limit), available)
             ctx.info(
@@ -698,8 +801,6 @@ class Executor:
             )
         else:
             total = available
-        # the gated/ungated warning, once per module
-        self._select(module, entity_filter, store, ctx=ctx, limit=1)
         with self._counters_lock:
             self._counters["work_items"] += total
         self.writer.emit(
@@ -712,7 +813,6 @@ class Executor:
         error: str | None = None
         status = "succeeded"
         cursor: str | None = None
-        last_beat = time.monotonic()
         try:
             while True:
                 self._guard()
@@ -749,9 +849,7 @@ class Executor:
                         with self._counters_lock:
                             self._counters[key] += len(items)
                     ctx.progress(seen, max(total, seen))
-                    if lock_owner and time.monotonic() - last_beat > 15:
-                        store.heartbeat_module_lock(module.name, lock_owner)
-                        last_beat = time.monotonic()
+                    self._check_lock(module)
                     if sample_limit:
                         break
                     cursor = items[-1].entity_id
@@ -779,9 +877,7 @@ class Executor:
                             self._counters[key] += 1
                     if seen % 25 == 0 or seen == total:
                         ctx.progress(seen, max(total, seen))
-                    if lock_owner and time.monotonic() - last_beat > 15:
-                        store.heartbeat_module_lock(module.name, lock_owner)
-                        last_beat = time.monotonic()
+                    self._check_lock(module)
                 if sample_limit:
                     break
                 cursor = items[-1].entity_id
@@ -796,8 +892,14 @@ class Executor:
         except (StopRequested, AbortRun):
             status = "stopped"
             raise
+        except LockLost as exc:
+            status, error = "failed", str(exc)
+            ctx.error(f"[{module.name}] {exc}")
+            raise AbortRun(f"module {module.name} lost its lock") from exc
         finally:
             ctx.entity = None
+            if seen >= 500:
+                store.refresh_statistics()
             with self._counters_lock:
                 self._counters["steps_run"] += 1
                 if contended:
@@ -839,13 +941,14 @@ class Executor:
         try:
             # Its writes go through ctx.db like any module's, so they need a
             # transaction of their own to commit in.
-            store.begin(self._tx_mode)
-            try:
+            with store.once_transaction(
+                module.name, module.version, run_id=self.run_id, mode=self._tx_mode
+            ):
                 module.fn(ctx)
-                store.commit()
-            except BaseException:
-                store.rollback()
-                raise
+        except LockLost as exc:
+            status, error = "failed", str(exc)
+            ctx.error(f"[{module.name}] {exc}")
+            raise AbortRun(f"module {module.name} lost its lock") from exc
         except (StopRequested, AbortRun):
             status = "stopped"
             raise
@@ -899,7 +1002,7 @@ class Executor:
             try:
                 with store.batch_transaction(
                     items, module.name, module.version,
-                    run_id=self.run_id, mode=self._tx_mode,
+                    run_id=self.run_id, mode=self._tx_mode, code_hash=module.code_hash or None,
                 ) as outcome:
                     try:
                         result = module.fn(ctx, entities)
@@ -927,7 +1030,7 @@ class Executor:
                     )
                     return "contended"
                 time.sleep(min(0.05 * (2**attempt), 1.0) * (0.5 + random.random()))
-            except (StopRequested, AbortRun):
+            except (StopRequested, AbortRun, LockLost):
                 raise
             except Exception as exc:  # noqa: BLE001
                 message = f"{type(exc).__name__}: {exc}"
@@ -947,7 +1050,37 @@ class Executor:
         return "contended"  # pragma: no cover - loop always returns
 
     def _run_entity_major(self, ctx: EntityContext, modules, entity_filter) -> None:
-        """Process each entity through the whole module chain before moving on."""
+        """Process each entity through the whole module chain before moving on.
+
+        Every module of the chain is locked for the whole walk, exactly as a
+        module-major worker locks its one module - nobody else may write any of
+        them meanwhile, and every unit is fenced against those locks.
+        """
+        assert self.state is not None
+        held: list[tuple[str, str]] = []
+        try:
+            for module in modules:
+                if module.scope == "once":
+                    continue
+                try:
+                    owner = self.state.acquire_module_lock(module.name, run_id=self.run_id)
+                except LockConflict as exc:
+                    ctx.error(f"[{module.name}] {exc}")
+                    raise AbortRun(f"module {module.name} is locked by another worker") from exc
+                held.append((module.name, owner))
+                if self._keeper is not None:
+                    self._keeper.hold(module.name, owner)
+            self._walk_entity_major(ctx, modules, entity_filter)
+        except LockLost as exc:
+            ctx.error(str(exc))
+            raise AbortRun("entity-major run lost a module lock") from exc
+        finally:
+            for name, owner in held:
+                if self._keeper is not None:
+                    self._keeper.release(name)
+                self.state.release_module_lock(name, owner)
+
+    def _walk_entity_major(self, ctx: EntityContext, modules, entity_filter) -> None:
         assert self.state is not None
         self._tx_mode = "immediate"
         pending: dict[str, Any] = {}
@@ -971,12 +1104,7 @@ class Executor:
                 self._guard()
                 item = pending[entity_id]
                 for module in modules:
-                    selected = self.state.select_work(
-                        module.name, module.version, mode=self.mode,
-                        requires=self.pipeline.requirements_for(module),
-                        cascade=self.pipeline.cascade,
-                        entity_ids=[entity_id],
-                    )
+                    selected = self._select(module, [entity_id], self.state)
                     if not selected:
                         continue
                     ctx.step = module.name
@@ -1028,7 +1156,6 @@ class Executor:
         ctx.step = module.name
         ctx.entity = entity
         t0 = time.perf_counter()
-        state.mark_running(item.entity_id, module.name, module.version, self.run_id)
         attempts = self.lock_retries + 1 if self._tx_mode == "deferred" else 1
         try:
             for attempt in range(attempts):
@@ -1048,7 +1175,7 @@ class Executor:
                         return "contended"
                     time.sleep(min(0.05 * (2**attempt), 1.0) * (0.5 + random.random()))
             return "contended"  # pragma: no cover - loop always returns
-        except (StopRequested, AbortRun):
+        except (StopRequested, AbortRun, LockLost):
             raise
         except Exception as exc:  # noqa: BLE001
             duration = elapsed_ms(t0, time.perf_counter())
@@ -1087,6 +1214,7 @@ class Executor:
             run_id=self.run_id,
             source_updated_at=item.source_updated_at,
             mode=self._tx_mode,
+            code_hash=module.code_hash or None,
         ) as outcome:
             try:
                 result = module.fn(ctx, entity)
@@ -1116,6 +1244,11 @@ class Executor:
 
     # ------------------------------------------------------------------ utils
 
+    def _check_lock(self, module: Module) -> None:
+        """Stop early when the keeper saw the lock go - fencing would refuse anyway."""
+        if self._keeper is not None and self._keeper.lost(module.name):
+            raise LockLost(f"module {module.name!r}: lock lost (heartbeat no longer ours)")
+
     def _guard(self) -> None:
         if self.control is None:
             return
@@ -1142,12 +1275,14 @@ class Executor:
             self._counters["entities_total"] = self.state.count_entities()
             remaining = 0
             for module in self.pipeline.ordered_modules():
-                remaining += len(
-                    self.state.select_work(
-                        module.name, module.version, mode="incremental",
-                        requires=self.pipeline.requirements_for(module),
-                        cascade=self.pipeline.cascade,
-                    )
+                if module.scope == "once":
+                    continue
+                remaining += self.state.count_work(
+                    module.name, module.version, mode="incremental",
+                    requires=self.pipeline.requirements_for(module),
+                    cascade=self.pipeline.cascade,
+                    apply_requirements=False,
+                    max_attempts=self.pipeline.max_attempts,
                 )
             self._counters["work_remaining"] = remaining
         except Exception:  # pragma: no cover - metrics must never break a run
